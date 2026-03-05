@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.feishu-claude.bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- 替换为你的 Python 路径，推荐用 venv 里的 -->
+        <string>/path/to/feishu-claude/.venv/bin/python</string>
+        <string>/path/to/feishu-claude/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/feishu-claude</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/feishu-claude.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/feishu-claude.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
