@@ -73,7 +73,7 @@
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/nicekid1/feishu-claude-code.git
+git clone https://github.com/joewongjc/feishu-claude-code.git
 cd feishu-claude-code
 
 # 2. 创建虚拟环境并安装依赖
