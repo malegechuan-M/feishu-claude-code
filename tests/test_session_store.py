@@ -73,3 +73,71 @@ def test_session_isolation_between_chats(temp_store):
 
     assert private_session.model == "claude-sonnet-4-6"
     assert group_session.model == "claude-haiku-4-5-20251001"
+
+
+def test_set_model_with_chat_id(temp_store):
+    """Test setting model for specific chat"""
+    user_id = "user_123"
+    chat_id = "group_456"
+
+    temp_store.set_model(user_id, chat_id, "claude-sonnet-4-6")
+
+    session = temp_store.get_current(user_id, chat_id)
+    assert session.model == "claude-sonnet-4-6"
+
+
+def test_set_permission_mode_with_chat_id(temp_store):
+    user_id = "user_123"
+    chat_id = "group_456"
+
+    temp_store.set_permission_mode(user_id, chat_id, "plan")
+    session = temp_store.get_current(user_id, chat_id)
+    assert session.permission_mode == "plan"
+
+
+def test_set_cwd_with_chat_id(temp_store):
+    user_id = "user_123"
+    chat_id = "group_456"
+
+    temp_store.set_cwd(user_id, chat_id, "/tmp")
+    session = temp_store.get_current(user_id, chat_id)
+    assert session.cwd == "/tmp"
+
+
+def test_new_session_with_chat_id(temp_store):
+    user_id = "user_123"
+    chat_id = "group_456"
+
+    # Create initial session
+    temp_store.set_model(user_id, chat_id, "claude-sonnet-4-6")
+
+    # Start new session
+    old_title = temp_store.new_session(user_id, chat_id)
+
+    # Verify new session is clean
+    session = temp_store.get_current(user_id, chat_id)
+    assert session.session_id is None
+
+
+def test_list_sessions_with_chat_id(temp_store):
+    user_id = "user_123"
+    chat_id = "group_456"
+
+    # Initially empty
+    sessions = temp_store.list_sessions(user_id, chat_id)
+    assert len(sessions) == 0
+
+    # Create and archive a session with a session_id
+    temp_store.set_model(user_id, chat_id, "claude-sonnet-4-6")
+    # Manually set a session_id to simulate a real session
+    raw = temp_store.get_current_raw(user_id, chat_id)
+    raw["session_id"] = "test_session_123"
+    temp_store._save()
+
+    # Now create new session, which should archive the old one
+    temp_store.new_session(user_id, chat_id)
+
+    # Should have one archived session
+    sessions = temp_store.list_sessions(user_id, chat_id)
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "test_session_123"

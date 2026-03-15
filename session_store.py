@@ -378,35 +378,59 @@ class SessionStore:
             cur["preview"] = _clean_preview(first_message)[:40]
         self._save()
 
-    def new_session(self, user_id: str) -> str:
-        """开始新 session，归档旧的并返回旧 session 的标题（空字符串表示无旧 session）"""
-        user = self._user(user_id)
-        cur = user["current"]
+    def new_session(self, user_id: str, chat_id: str) -> str:
+        """Start a new session for a specific chat, return old session title"""
+        chat_key = "private" if chat_id == user_id else chat_id
+
+        if user_id not in self._data:
+            self._data[user_id] = {}
+
+        if chat_key not in self._data[user_id]:
+            self._data[user_id][chat_key] = {
+                "current": {
+                    "session_id": None,
+                    "model": DEFAULT_MODEL,
+                    "cwd": DEFAULT_CWD,
+                    "permission_mode": PERMISSION_MODE,
+                    "started_at": datetime.now().isoformat(),
+                    "preview": "",
+                },
+                "history": [],
+            }
+
+        chat_data = self._data[user_id][chat_key]
+        cur = chat_data["current"]
         old_title = ""
+
         if cur.get("session_id"):
             old_id = cur["session_id"]
-            # 归档当前 session（先去重）
-            user["history"] = [h for h in user["history"] if h["session_id"] != old_id]
-            user["history"].append({
+            # Archive current session (dedup first)
+            chat_data["history"] = [h for h in chat_data.get("history", []) if h["session_id"] != old_id]
+            chat_data["history"].append({
                 "session_id": old_id,
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
-            user["history"] = user["history"][-20:]
-            # 获取摘要：优先缓存，否则生成
-            old_title = user.get("summaries", {}).get(old_id, "")
+            chat_data["history"] = chat_data["history"][-20:]
+
+            # Get summary: prefer cached, otherwise generate
+            summaries = self._data[user_id].get("summaries", {})
+            old_title = summaries.get(old_id, "")
             if not old_title:
                 try:
                     old_title = generate_summary(old_id)
                     if old_title:
-                        user.setdefault("summaries", {})[old_id] = old_title
+                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
                         _write_custom_title(old_id, old_title)
                 except Exception:
                     old_title = ""
-        user["current"] = {
+
+        # Create new session
+        chat_data["current"] = {
             "session_id": None,
             "model": cur.get("model", DEFAULT_MODEL),
             "cwd": cur.get("cwd", DEFAULT_CWD),
+            "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
             "preview": "",
         }
@@ -436,12 +460,50 @@ class SessionStore:
         self._data[user_id][chat_key]["current"]["model"] = model
         self._save()
 
-    def set_cwd(self, user_id: str, cwd: str):
-        self._user(user_id)["current"]["cwd"] = cwd
+    def set_cwd(self, user_id: str, chat_id: str, cwd: str):
+        """Set working directory for a specific chat"""
+        chat_key = "private" if chat_id == user_id else chat_id
+
+        if user_id not in self._data:
+            self._data[user_id] = {}
+
+        if chat_key not in self._data[user_id]:
+            self._data[user_id][chat_key] = {
+                "current": {
+                    "session_id": None,
+                    "model": DEFAULT_MODEL,
+                    "cwd": DEFAULT_CWD,
+                    "permission_mode": PERMISSION_MODE,
+                    "started_at": datetime.now().isoformat(),
+                    "preview": "",
+                },
+                "history": [],
+            }
+
+        self._data[user_id][chat_key]["current"]["cwd"] = cwd
         self._save()
 
-    def set_permission_mode(self, user_id: str, mode: str):
-        self._user(user_id)["current"]["permission_mode"] = mode
+    def set_permission_mode(self, user_id: str, chat_id: str, mode: str):
+        """Set permission mode for a specific chat"""
+        chat_key = "private" if chat_id == user_id else chat_id
+
+        if user_id not in self._data:
+            self._data[user_id] = {}
+
+        if chat_key not in self._data[user_id]:
+            self._data[user_id][chat_key] = {
+                "current": {
+                    "session_id": None,
+                    "model": DEFAULT_MODEL,
+                    "cwd": DEFAULT_CWD,
+                    "permission_mode": PERMISSION_MODE,
+                    "started_at": datetime.now().isoformat(),
+                    "preview": "",
+                },
+                "history": [],
+            }
+
+        self._data[user_id][chat_key]["current"]["permission_mode"] = mode
         self._save()
 
     def resume_session(self, user_id: str, index_or_id: str) -> tuple[Optional[str], str]:
@@ -495,8 +557,17 @@ class SessionStore:
         self._save()
         return session_id, old_title
 
-    def list_sessions(self, user_id: str) -> list:
-        return list(reversed(self._user(user_id)["history"]))
+    def list_sessions(self, user_id: str, chat_id: str) -> list:
+        """List all sessions for a specific chat"""
+        chat_key = "private" if chat_id == user_id else chat_id
+
+        if user_id not in self._data:
+            return []
+
+        if chat_key not in self._data[user_id]:
+            return []
+
+        return list(reversed(self._data[user_id][chat_key].get("history", [])))
 
     def get_current_raw(self, user_id: str, chat_id: str = None) -> dict:
         """Get raw current session data for a specific chat"""
