@@ -506,10 +506,18 @@ class SessionStore:
         self._data[user_id][chat_key]["current"]["permission_mode"] = mode
         self._save()
 
-    def resume_session(self, user_id: str, index_or_id: str) -> tuple[Optional[str], str]:
+    def resume_session(self, user_id: str, chat_id: str, index_or_id: str) -> tuple[Optional[str], str]:
         """按序号（1-based）或 session_id 恢复 session，返回 (session_id, old_title)"""
-        user = self._user(user_id)
-        history = user["history"]
+        chat_key = "private" if chat_id == user_id else chat_id
+
+        if user_id not in self._data:
+            return None, ""
+
+        if chat_key not in self._data[user_id]:
+            return None, ""
+
+        chat_data = self._data[user_id][chat_key]
+        history = chat_data.get("history", [])
 
         try:
             idx = int(index_or_id) - 1
@@ -521,24 +529,25 @@ class SessionStore:
             session_id = index_or_id
 
         # 归档 outgoing session（如果有且不是同一个）
-        cur = user["current"]
+        cur = chat_data["current"]
         old_id = cur.get("session_id")
         old_title = ""
         if old_id and old_id != session_id:
-            user["history"] = [h for h in user["history"] if h["session_id"] != old_id]
-            user["history"].append({
+            chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
+            chat_data["history"].append({
                 "session_id": old_id,
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
-            user["history"] = user["history"][-20:]
+            chat_data["history"] = chat_data["history"][-20:]
             # 获取摘要：优先缓存，否则生成
-            old_title = user.get("summaries", {}).get(old_id, "")
+            summaries = self._data[user_id].get("summaries", {})
+            old_title = summaries.get(old_id, "")
             if not old_title:
                 try:
                     old_title = generate_summary(old_id)
                     if old_title:
-                        user.setdefault("summaries", {})[old_id] = old_title
+                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
                         _write_custom_title(old_id, old_title)
                 except Exception:
                     old_title = ""
@@ -546,7 +555,7 @@ class SessionStore:
         # 从 history 中找回原始 preview 和 started_at
         original_preview = ""
         original_started = ""
-        for h in user["history"]:
+        for h in chat_data["history"]:
             if h["session_id"] == session_id:
                 original_preview = h.get("preview", "")
                 original_started = h.get("started_at", "")

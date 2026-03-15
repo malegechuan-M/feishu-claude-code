@@ -83,16 +83,16 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 BOT_COMMANDS = {"help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "skills", "mcp", "usage"}
 
 
-def _build_session_list(user_id: str, store: SessionStore) -> list[dict]:
+def _build_session_list(user_id: str, chat_id: str, store: SessionStore) -> list[dict]:
     """构建合并、去重、排序后的 session 列表（不含当前 session）。
     /resume 列表展示和 /resume N 选择都用这一个函数，保证索引一致。"""
-    cur_sid = store.get_current_raw(user_id).get("session_id")
+    cur_sid = store.get_current_raw(user_id, chat_id).get("session_id")
 
     cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
     feishu_sessions = [
-        {**s, "source": "feishu"} for s in store.list_sessions(user_id)
+        {**s, "source": "feishu"} for s in store.list_sessions(user_id, chat_id)
     ]
     for s in feishu_sessions:
         cli_info = cli_preview_map.get(s["session_id"])
@@ -120,17 +120,17 @@ def _build_session_list(user_id: str, store: SessionStore) -> list[dict]:
     return deduped[:15]
 
 
-def _format_session_list(user_id: str, store: SessionStore) -> str:
+def _format_session_list(user_id: str, chat_id: str, store: SessionStore) -> str:
     """生成历史 sessions 列表（去重 + 手机友好格式），含当前 session"""
     from session_store import _clean_preview
 
-    cur = store.get_current_raw(user_id)
+    cur = store.get_current_raw(user_id, chat_id)
     cur_sid = cur.get("session_id")
 
     cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
-    all_sessions = _build_session_list(user_id, store)
+    all_sessions = _build_session_list(user_id, chat_id, store)
 
     def _fmt_time(raw: str) -> str:
         t = raw[:16].replace("T", " ")
@@ -378,6 +378,7 @@ def handle_command(
     cmd: str,
     args: str,
     user_id: str,
+    chat_id: str,
     store: SessionStore,
 ) -> Optional[str]:
     """处理命令，返回回复文本。返回 None 表示不是 bot 命令，应转发给 Claude。"""
@@ -389,25 +390,25 @@ def handle_command(
         return HELP_TEXT
 
     elif cmd in ("new", "clear"):
-        old_title = store.new_session(user_id)
+        old_title = store.new_session(user_id, chat_id)
         if old_title:
             return f"✅ 已开始新 session。\n上个会话：「{old_title}」"
         return "✅ 已开始新 session，之前的对话历史已清除。"
 
     elif cmd == "resume":
         if not args:
-            return _format_session_list(user_id, store)
+            return _format_session_list(user_id, chat_id, store)
         # 如果是数字序号，先在合并列表中找到对应 session_id
         try:
             idx = int(args) - 1
-            all_sessions = _build_session_list(user_id, store)
+            all_sessions = _build_session_list(user_id, chat_id, store)
             if 0 <= idx < len(all_sessions):
                 args = all_sessions[idx]["session_id"]
             else:
                 return f"❌ 序号 {int(args)} 超出范围（共 {len(all_sessions)} 条）。"
         except ValueError:
             pass  # 直接用 session ID 字符串
-        session_id, old_title = store.resume_session(user_id, args)
+        session_id, old_title = store.resume_session(user_id, chat_id, args)
         if not session_id:
             return f"❌ 未找到 session：`{args}`，用 `/resume` 查看列表。"
         reply = f"✅ 已恢复 session `{session_id[:8]}...`，继续对话吧。"
@@ -417,14 +418,14 @@ def handle_command(
 
     elif cmd == "model":
         if not args:
-            cur = store.get_current(user_id)
+            cur = store.get_current(user_id, chat_id)
             return f"当前模型：`{cur.model}`\n可用：opus / sonnet / haiku 或完整模型 ID"
         model = MODEL_ALIASES.get(args.lower(), args)
-        store.set_model(user_id, model)
+        store.set_model(user_id, chat_id, model)
         return f"✅ 已切换模型为 `{model}`"
 
     elif cmd == "status":
-        cur = store.get_current_raw(user_id)
+        cur = store.get_current_raw(user_id, chat_id)
         sid = cur.get("session_id") or "（新 session）"
         model = cur.get("model", "未知")
         cwd = cur.get("cwd", "~")
@@ -441,7 +442,7 @@ def handle_command(
 
     elif cmd == "mode":
         if not args:
-            cur = store.get_current(user_id)
+            cur = store.get_current(user_id, chat_id)
             current_mode = cur.permission_mode
             lines = [f"当前模式：**{current_mode}** — {VALID_MODES.get(current_mode, '')}\n"]
             lines.append("**可选模式：**")
@@ -453,7 +454,7 @@ def handle_command(
         mode = MODE_ALIASES.get(args.lower(), args)
         if mode not in VALID_MODES:
             return f"❌ 未知模式：`{args}`\n可选：{', '.join(f'`{m}`' for m in VALID_MODES)}"
-        store.set_permission_mode(user_id, mode)
+        store.set_permission_mode(user_id, chat_id, mode)
         return f"✅ 已切换为 **{mode}** — {VALID_MODES[mode]}"
 
     elif cmd == "cd":
@@ -462,7 +463,7 @@ def handle_command(
         path = os.path.expanduser(args)
         if not os.path.isdir(path):
             return f"❌ 路径不存在：`{path}`"
-        store.set_cwd(user_id, path)
+        store.set_cwd(user_id, chat_id, path)
         return f"✅ 工作目录已切换为 `{path}`"
 
     elif cmd == "skills":

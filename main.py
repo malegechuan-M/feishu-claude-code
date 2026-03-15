@@ -63,34 +63,60 @@ _user_locks: dict[str, asyncio.Lock] = {}
 
 # ── 核心消息处理（async）─────────────────────────────────────
 
+def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool]:
+    """
+    Extract user_id, chat_id, and is_group from message event.
+
+    Returns:
+        (user_id, chat_id, is_group)
+        - For private chat: chat_id = user_id
+        - For group chat: chat_id = group's chat_id
+    """
+    sender = event.event.sender
+    user_id = sender.sender_id.open_id
+
+    # Check message type to determine if it's a group chat
+    message = event.event.message
+    chat_type = message.chat_type
+    chat_id_raw = message.chat_id
+
+    # chat_type: "p2p" for private, "group" for group
+    is_group = (chat_type == "group")
+
+    if is_group:
+        chat_id = chat_id_raw
+    else:
+        # Private chat: use user_id as chat_id
+        chat_id = user_id
+
+    return user_id, chat_id, is_group
+
 async def handle_message_async(event: P2ImMessageReceiveV1):
     """异步处理一条飞书消息"""
     msg = event.event.message
     print(f"[收到消息] type={msg.message_type} chat={msg.chat_type}", flush=True)
 
-    # 只处理私聊消息
-    if msg.chat_type != "p2p":
-        return
-
-    sender_open_id = event.event.sender.sender_id.open_id
+    # Extract chat info (supports both private and group chats)
+    user_id, chat_id, is_group = extract_chat_info(event)
+    print(f"[Chat Info] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
 
     # 获取该用户的队列锁，保证消息串行处理
-    if sender_open_id not in _user_locks:
-        _user_locks[sender_open_id] = asyncio.Lock()
-    lock = _user_locks[sender_open_id]
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    lock = _user_locks[user_id]
 
     async with lock:
         try:
-            await _process_message(sender_open_id, msg)
+            await _process_message(user_id, chat_id, msg)
         except Exception as e:
             print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
 
 
-async def _process_message(sender_open_id: str, msg):
+async def _process_message(user_id: str, chat_id: str, msg):
     """实际处理消息的逻辑，在 per-user lock 保护下执行"""
-    print(f"[处理消息] sender={sender_open_id[:8]}...", flush=True)
+    print(f"[处理消息] user={user_id[:8]}... chat={chat_id[:8]}...", flush=True)
     text = ""
     img_path = None
 
@@ -112,7 +138,7 @@ async def _process_message(sender_open_id: str, msg):
             text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
         except Exception as e:
             print(f"[error] 下载图片失败: {e}")
-            await feishu.send_text_to_user(sender_open_id, f"❌ 下载图片失败：{e}")
+            await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
             return
 
     else:
@@ -122,26 +148,26 @@ async def _process_message(sender_open_id: str, msg):
     parsed = parse_command(text)
     if parsed:
         cmd, args = parsed
-        reply = handle_command(cmd, args, sender_open_id, store)
+        reply = handle_command(cmd, args, user_id, chat_id, store)
         if reply is not None:
             if cmd == "resume" and not args:
-                await feishu.send_text_to_user(sender_open_id, reply)
+                await feishu.send_text_to_user(user_id, reply)
             else:
-                await feishu.send_card_to_user(sender_open_id, content=reply, loading=False)
+                await feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
         # reply is None → 不是 bot 命令，当作普通消息（含 /xxx）转发给 Claude
 
     # ── 普通消息 → 调用 Claude ──────────────────────────────
-    session = store.get_current(sender_open_id)
+    session = store.get_current(user_id, chat_id)
     print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
 
     # 1. 发送"思考中"占位卡片，拿到 message_id
     try:
-        card_msg_id = await feishu.send_card_to_user(sender_open_id, loading=True)
+        card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
         print(f"[卡片] card_msg_id={card_msg_id}", flush=True)
     except Exception as e:
         print(f"[error] 发送占位卡片失败: {e}", flush=True)
-        await feishu.send_text_to_user(sender_open_id, f"❌ 发送消息失败：{e}")
+        await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
         return
 
     accumulated = ""
@@ -211,7 +237,7 @@ async def _process_message(sender_open_id: str, msg):
 
     # 6. 更新 session 状态
     if new_session_id:
-        store.on_claude_response(sender_open_id, new_session_id, text)
+        store.on_claude_response(user_id, new_session_id, text)
 
 
 def _format_tool(name: str, inp: dict) -> str:
