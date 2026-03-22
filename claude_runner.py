@@ -6,9 +6,11 @@
 import asyncio
 import json
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
+
+IDLE_TIMEOUT = 300  # 5 分钟无任何输出视为挂死
 
 
 def _extract_text_content(value) -> str:
@@ -24,35 +26,13 @@ def _extract_text_content(value) -> str:
     return ""
 
 
-def _apply_stream_payload(data: dict, stream_text: str, result_text: str, session_id: Optional[str]) -> tuple[str, str, Optional[str]]:
-    """Apply one stream-json payload to the current parse state."""
-    event_type = data.get("type")
-
-    if event_type == "system":
-        sid = data.get("session_id")
-        if sid:
-            session_id = sid
-
-    elif event_type == "stream_event":
-        evt = data.get("event", {})
-        evt_type = evt.get("type")
-
-        if evt_type == "content_block_delta":
-            delta = evt.get("delta", {})
-            if delta.get("type") == "text_delta":
-                chunk = delta.get("text", "")
-                if chunk:
-                    stream_text += chunk
-
-    elif event_type == "result":
-        sid = data.get("session_id")
-        if sid:
-            session_id = sid
-        final_text = _extract_text_content(data.get("result", ""))
-        if final_text:
-            result_text = final_text
-
-    return stream_text, result_text, session_id
+async def _fire_callback(cb, *args):
+    if cb is None:
+        return
+    if asyncio.iscoroutinefunction(cb):
+        await cb(*args)
+    else:
+        cb(*args)
 
 
 async def run_claude(
@@ -61,13 +41,17 @@ async def run_claude(
     model: Optional[str] = None,
     cwd: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    on_text_chunk: Optional[Callable[[str], None]] = None,
+    on_tool_use: Optional[Callable[[str, dict], None]] = None,
+    on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
 ) -> tuple[str, Optional[str], bool]:
     """
-    调用 claude CLI 并返回完整回复（不再流式）。
+    调用 claude CLI 并流式解析输出。
 
     Returns:
         (full_response_text, new_session_id, used_fresh_session_fallback)
     """
+
     async def _run_once(active_session_id: Optional[str]) -> tuple[str, Optional[str], int, str]:
         cmd = [
             CLAUDE_CLI,
@@ -92,39 +76,101 @@ async def run_claude(
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd or os.path.expanduser("~"),
             env=env,
-            limit=10 * 1024 * 1024,  # 10MB，防止大响应超出默认 64KB 限制
+            limit=10 * 1024 * 1024,
         )
+
+        await _fire_callback(on_process_start, proc)
 
         proc.stdin.write((message + "\n").encode())
         await proc.stdin.drain()
         proc.stdin.close()
 
-        stream_text = ""
-        result_text = ""
+        full_text = ""
         new_session_id = None
+        pending_tool_name = ""
+        pending_tool_input_json = ""
 
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
+        try:
+            while True:
+                try:
+                    raw_line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=IDLE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    raise RuntimeError(
+                        f"Claude 执行超时（{IDLE_TIMEOUT}秒无输出），已终止进程"
+                    )
 
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                if not raw_line:  # EOF
+                    break
 
-            stream_text, result_text, new_session_id = _apply_stream_payload(
-                data,
-                stream_text,
-                result_text,
-                new_session_id,
-            )
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = data.get("type")
+
+                if event_type == "system":
+                    sid = data.get("session_id")
+                    if sid:
+                        new_session_id = sid
+
+                elif event_type == "stream_event":
+                    evt = data.get("event", {})
+                    evt_type = evt.get("type")
+
+                    if evt_type == "content_block_delta":
+                        delta = evt.get("delta", {})
+                        delta_type = delta.get("type")
+
+                        if delta_type == "text_delta":
+                            chunk = delta.get("text", "")
+                            if chunk:
+                                full_text += chunk
+                                await _fire_callback(on_text_chunk, chunk)
+
+                        elif delta_type == "input_json_delta":
+                            pending_tool_input_json += delta.get("partial_json", "")
+
+                    elif evt_type == "content_block_start":
+                        block = evt.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            pending_tool_name = block.get("name", "")
+                            pending_tool_input_json = ""
+                            await _fire_callback(on_tool_use, pending_tool_name, {})
+
+                    elif evt_type == "content_block_stop":
+                        if pending_tool_name and pending_tool_input_json:
+                            try:
+                                inp = json.loads(pending_tool_input_json)
+                            except json.JSONDecodeError:
+                                inp = {}
+                            await _fire_callback(on_tool_use, pending_tool_name, inp)
+                        pending_tool_name = ""
+                        pending_tool_input_json = ""
+
+                elif event_type == "result":
+                    sid = data.get("session_id")
+                    if sid:
+                        new_session_id = sid
+                    final_text = _extract_text_content(data.get("result", ""))
+                    if final_text:
+                        full_text = final_text
+
+        except RuntimeError:
+            raise
 
         stderr_output = await proc.stderr.read()
         await proc.wait()
         stderr_text = stderr_output.decode("utf-8", errors="replace").strip()
-        final_text = (result_text or stream_text).strip()
-        return final_text, new_session_id, proc.returncode, stderr_text
+        return full_text.strip(), new_session_id, proc.returncode, stderr_text
 
     final_text, new_session_id, returncode, stderr_text = await _run_once(session_id)
     used_fresh_session_fallback = False

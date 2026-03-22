@@ -12,6 +12,7 @@
 - **流式卡片实时输出** - Claude 边想边输出，不是等半天发一坨文字
 - **复用 Claude Max 订阅** - 直接调用本机 `claude` CLI，不需要额外 API Key
 - **完整 Session 管理** - 手机上开始的对话，回到电脑前接着聊
+- **群聊支持 (beta)** - 拉机器人进群，@机器人 即可对话，不同群独立 session
 - **图片识别** - 直接发截图给 Claude 分析
 - **斜杠命令** - 在飞书里切换模型、恢复会话、查看用量
 - **Claude Skills 透传** - `/commit`、`/review` 等 Claude Skills 直接在飞书里用
@@ -28,7 +29,7 @@
 | `/ls` | 查看当前工作目录内容 |
 | `/ls src` | 查看当前工作目录下某个子目录 |
 | `/ws save 项目A ~/project-a` | 保存命名工作空间 |
-| `/ws use 项目A` | 将当前群组/私聊绑定到某个工作空间 |
+| `/ws use 项目A` | 绑定当前群组/私聊到工作空间 |
 | `/usage` | 查看 Claude Max 用量 (macOS) |
 | `/skills` | 列出 Claude Skills |
 | `/mcp` | 列出 MCP Servers |
@@ -36,25 +37,15 @@
 | `/help` | 帮助 |
 | `/commit` 等 | 透传给 Claude CLI Skills |
 
-## 迁移指南（现有用户）
+## 群聊支持 (beta)
 
-如果你从旧版本升级，需要迁移 session 数据以支持群组功能：
+拉机器人进群即可使用。群聊中需要 **@机器人** 才会触发回复，不 @ 的消息会静默忽略。
 
-```bash
-# 运行迁移脚本（会自动备份）
-python migrate_sessions.py
+- 每个群有独立的 session、模型、工作目录
+- 私聊和群聊互不干扰
+- 用 `/ws` 命令为不同群绑定不同项目目录
 
-# 如果出现问题，可以回滚：
-cp ~/.feishu-claude/sessions.json.backup.YYYYMMDD_HHMMSS ~/.feishu-claude/sessions.json
-```
-
-迁移脚本会：
-- 自动备份原数据
-- 将数据迁移到新格式（支持群组隔离）
-- 验证迁移完整性
-- 提供回滚指令
-
-**注意**：迁移后，你的私聊 session 会继续正常工作，无需任何操作。
+> **迁移**：从旧版升级的用户可运行 `python migrate_sessions.py` 迁移 session 数据（会自动备份）。私聊功能无需迁移，直接兼容。
 
 ## 架构
 
@@ -78,7 +69,7 @@ cp ~/.feishu-claude/sessions.json.backup.YYYYMMDD_HHMMSS ~/.feishu-claude/sessio
 - **工具调用进度** - 实时显示 Claude 正在读文件、执行命令等操作
 - **看门狗自愈** - 4 小时自动重启，防止 WebSocket 假死
 - **多用户隔离** - 每个飞书用户独立 session，互不干扰
-- **群组工作空间绑定** - 不同群组可长期绑定不同项目目录，切群即切项目
+- **群聊支持 (beta)** - @机器人触发回复，不同群独立 session 和工作目录
 - **多群组并发** - 同一用户在多个群组同时调用 Claude，互不阻塞
 
 ---

@@ -54,61 +54,52 @@ def test_extract_chat_info_group_chat():
 
 # ── Test session isolation ──────────────────────────────────
 
-def test_session_isolation_private_vs_group(session_store):
+@pytest.mark.asyncio
+async def test_session_isolation_private_vs_group(session_store):
     """Test that private and group chats have isolated sessions"""
     user_id = "user_123"
     private_chat_id = user_id
     group_chat_id = "group_456"
 
-    # Get session for private chat
-    private_session = session_store.get_current(user_id, private_chat_id)
-    private_session.model = "claude-opus"
-    session_store.set_model(user_id, private_chat_id, "claude-opus")
+    await session_store.set_model(user_id, private_chat_id, "claude-opus")
+    await session_store.set_model(user_id, group_chat_id, "claude-sonnet")
 
-    # Get session for group chat
-    group_session = session_store.get_current(user_id, group_chat_id)
-    group_session.model = "claude-sonnet"
-    session_store.set_model(user_id, group_chat_id, "claude-sonnet")
-
-    # Verify isolation
-    private_check = session_store.get_current(user_id, private_chat_id)
-    group_check = session_store.get_current(user_id, group_chat_id)
+    private_check = await session_store.get_current(user_id, private_chat_id)
+    group_check = await session_store.get_current(user_id, group_chat_id)
 
     assert private_check.model == "claude-opus"
     assert group_check.model == "claude-sonnet"
 
 
-def test_multiple_groups_isolation(session_store):
+@pytest.mark.asyncio
+async def test_multiple_groups_isolation(session_store):
     """Test that multiple groups have independent sessions"""
     user_id = "user_123"
     group1_id = "group_001"
     group2_id = "group_002"
 
-    # Set different models for each group
-    session_store.set_model(user_id, group1_id, "claude-opus")
-    session_store.set_model(user_id, group2_id, "claude-sonnet")
+    await session_store.set_model(user_id, group1_id, "claude-opus")
+    await session_store.set_model(user_id, group2_id, "claude-sonnet")
 
-    # Verify each group has its own model
-    group1_session = session_store.get_current(user_id, group1_id)
-    group2_session = session_store.get_current(user_id, group2_id)
+    group1_session = await session_store.get_current(user_id, group1_id)
+    group2_session = await session_store.get_current(user_id, group2_id)
 
     assert group1_session.model == "claude-opus"
     assert group2_session.model == "claude-sonnet"
 
 
-def test_multiple_users_in_same_group(session_store):
+@pytest.mark.asyncio
+async def test_multiple_users_in_same_group(session_store):
     """Test that different users in same group have separate sessions"""
     group_id = "group_123"
     user1_id = "user_001"
     user2_id = "user_002"
 
-    # Set different models for each user in same group
-    session_store.set_model(user1_id, group_id, "claude-opus")
-    session_store.set_model(user2_id, group_id, "claude-sonnet")
+    await session_store.set_model(user1_id, group_id, "claude-opus")
+    await session_store.set_model(user2_id, group_id, "claude-sonnet")
 
-    # Verify each user has their own session
-    user1_session = session_store.get_current(user1_id, group_id)
-    user2_session = session_store.get_current(user2_id, group_id)
+    user1_session = await session_store.get_current(user1_id, group_id)
+    user2_session = await session_store.get_current(user2_id, group_id)
 
     assert user1_session.model == "claude-opus"
     assert user2_session.model == "claude-sonnet"
@@ -116,55 +107,58 @@ def test_multiple_users_in_same_group(session_store):
 
 # ── Test session operations with chat_id ──────────────────
 
-def test_set_permission_mode_with_chat_id(session_store):
+@pytest.mark.asyncio
+async def test_set_permission_mode_with_chat_id(session_store):
     """Test setting permission mode for specific chat"""
     user_id = "user_123"
     chat_id = "group_456"
 
-    session_store.set_permission_mode(user_id, chat_id, "restricted")
-    session = session_store.get_current(user_id, chat_id)
+    await session_store.set_permission_mode(user_id, chat_id, "restricted")
+    session = await session_store.get_current(user_id, chat_id)
 
     assert session.permission_mode == "restricted"
 
 
-def test_set_cwd_with_chat_id(session_store):
+@pytest.mark.asyncio
+async def test_set_cwd_with_chat_id(session_store):
     """Test setting working directory for specific chat"""
     user_id = "user_123"
     chat_id = "group_456"
 
-    session_store.set_cwd(user_id, chat_id, "/tmp/work")
-    session = session_store.get_current(user_id, chat_id)
+    await session_store.set_cwd(user_id, chat_id, "/tmp/work")
+    session = await session_store.get_current(user_id, chat_id)
 
     assert session.cwd == "/tmp/work"
 
 
-def test_new_session_with_chat_id(session_store):
+@pytest.mark.asyncio
+async def test_new_session_with_chat_id(session_store):
     """Test creating new session for specific chat"""
     user_id = "user_123"
     chat_id = "group_456"
 
-    session_store.new_session(user_id, chat_id)
-    session = session_store.get_current(user_id, chat_id)
+    await session_store.new_session(user_id, chat_id)
+    session = await session_store.get_current(user_id, chat_id)
 
-    assert session.session_id is None  # New session has no ID yet
+    assert session.session_id is None
 
 
-def test_list_sessions_with_chat_id(session_store):
+@pytest.mark.asyncio
+async def test_list_sessions_with_chat_id(session_store):
     """Test listing sessions for specific chat"""
     user_id = "user_list_test"
     chat_id = "group_list_test"
 
-    # Initially empty for this user/chat combo
-    sessions = session_store.list_sessions(user_id, chat_id)
+    sessions = await session_store.list_sessions(user_id, chat_id)
     assert isinstance(sessions, list)
 
 
-def test_resume_session_with_chat_id(session_store):
+@pytest.mark.asyncio
+async def test_resume_session_with_chat_id(session_store):
     """Test resuming session in specific chat"""
     user_id = "user_resume_test"
     chat_id = "group_resume_test"
 
-    # Try to resume non-existent session
-    resumed_id, old_title = session_store.resume_session(user_id, chat_id, "1")
+    resumed_id, old_title = await session_store.resume_session(user_id, chat_id, "1")
     assert resumed_id is None
     assert old_title == ""

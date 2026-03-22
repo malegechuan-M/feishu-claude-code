@@ -136,7 +136,7 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) 
     cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
 
-    all_sessions = _build_session_list(user_id, chat_id, store)
+    all_sessions = await _build_session_list(user_id, chat_id, store)
 
     def _fmt_time(raw: str) -> str:
         t = raw[:16].replace("T", " ")

@@ -331,7 +331,7 @@ class SessionStore:
                     chat_data["history"] = cleaned
                     changed = True
         if changed:
-            asyncio.run(self._save_async())
+            self._save()
 
     def _user(self, user_id: str) -> dict:
         return self._data.setdefault(user_id, {})
