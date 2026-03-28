@@ -86,7 +86,7 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
-    "workspace", "ws", "skills", "mcp", "usage", "stop",
+    "workspace", "ws", "skills", "mcp", "usage", "stop", "schedule",
 }
 
 
@@ -649,6 +649,101 @@ async def handle_command(
 
     elif cmd == "stop":
         return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"
+
+    elif cmd == "schedule":
+        from scheduler import add_schedule, remove_schedule, list_schedules
+        if not args:
+            tasks = list_schedules(chat_id)
+            if not tasks:
+                return (
+                    "⏰ 当前没有定时任务。\n\n"
+                    "**用法：**\n"
+                    "`/schedule HH:MM 任务描述` — 每天固定时间\n"
+                    "`/schedule every Xm 任务描述` — 每 X 分钟\n"
+                    "`/schedule */5 * * * * 任务描述` — cron 表达式\n\n"
+                    "**示例：**\n"
+                    "`/schedule 08:00 生成今日工作摘要并发给我`\n"
+                    "`/schedule del 任务ID` — 删除任务"
+                )
+            lines = ["⏰ **定时任务列表**\n"]
+            for t in tasks:
+                status = "✅" if t.get("enabled") else "❌"
+                lines.append(f"{status} `{t['id']}` | `{t['cron']}` | {t['task'][:30]}")
+            lines.append("\n删除：`/schedule del 任务ID`")
+            return "\n".join(lines)
+
+        parts = args.split(None, 1)
+        if parts[0].lower() in ("del", "delete", "rm", "remove"):
+            if len(parts) < 2:
+                return "⚠️ 用法：`/schedule del 任务ID`"
+            success = remove_schedule(parts[1].strip())
+            return "✅ 已删除" if success else "❌ 未找到该任务 ID"
+
+        # 解析 cron 表达式（支持 HH:MM、every Xm、标准 5 字段 cron）
+        import re
+        # every Xm 格式
+        m = re.match(r"(every\s+\d+m)\s+(.*)", args, re.DOTALL)
+        if m:
+            cron_expr, task_prompt = m.group(1).strip(), m.group(2).strip()
+        # HH:MM 格式
+        elif re.match(r"^\d{1,2}:\d{2}\s+", args):
+            cron_expr, _, task_prompt = args.partition(" ")
+            task_prompt = task_prompt.strip()
+        # 标准 5 字段 cron（以空格分隔的 5 段 + 任务描述）
+        else:
+            cron_parts = args.split(None, 5)
+            if len(cron_parts) >= 6:
+                cron_expr = " ".join(cron_parts[:5])
+                task_prompt = cron_parts[5]
+            else:
+                return "⚠️ 格式错误。用法：`/schedule HH:MM 任务内容`"
+
+        if not task_prompt:
+            return "⚠️ 任务描述不能为空"
+
+        task_id = add_schedule(chat_id, cron_expr, task_prompt)
+        return (
+            f"✅ **定时任务已创建**\n"
+            f"ID：`{task_id}`\n"
+            f"时间：`{cron_expr}`\n"
+            f"任务：{task_prompt}"
+        )
+
+    elif cmd == "memory":
+        from memory_local import read_recent_logs, read_pending_candidates, MEMORY_FILE, SOUL_FILE
+        if args == "soul":
+            try:
+                return f"**SOUL.md**\n\n{SOUL_FILE.read_text(encoding='utf-8')}"
+            except Exception:
+                return "❌ 读取 SOUL.md 失败"
+        if args == "brain":
+            try:
+                return f"**MEMORY.md**\n\n{MEMORY_FILE.read_text(encoding='utf-8')}"
+            except Exception:
+                return "❌ 读取 MEMORY.md 失败"
+        # 默认：显示最近日志摘要 + 待晋升候选
+        logs = read_recent_logs(days=3)
+        candidates = read_pending_candidates()
+        parts = ["**本地记忆系统**\n"]
+        if logs:
+            parts.append(f"**最近日志摘要**\n{logs[:1200]}")
+        else:
+            parts.append("（暂无日志摘要）")
+        if candidates:
+            parts.append(f"**待晋升候选**\n{candidates[:800]}")
+        parts.append("\n子命令：`/memory soul` | `/memory brain` | `/promote 规则内容`")
+        return "\n\n".join(parts)
+
+    elif cmd == "promote":
+        if not args:
+            from memory_local import read_pending_candidates
+            candidates = read_pending_candidates()
+            if not candidates:
+                return "📭 当前没有待晋升的记忆候选。"
+            return f"**待晋升候选**（用 `/promote 规则内容` 确认写入）\n\n{candidates[:1500]}"
+        from memory_local import promote_to_memory
+        ok = promote_to_memory(args)
+        return f"✅ 已写入 MEMORY.md：{args}" if ok else "❌ 写入失败"
 
     else:
         return None  # fallback: 转发给 Claude

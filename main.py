@@ -7,11 +7,13 @@
 
 import asyncio
 import json
+import ssl
 import sys
 import os
 import threading
 import time
 import traceback
+import urllib.request
 
 # 确保项目目录在 sys.path 最前面
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +27,39 @@ from session_store import SessionStore
 from commands import parse_command, handle_command
 from claude_runner import run_claude
 from run_control import ActiveRun, ActiveRunRegistry, stop_run
+from memory_bridge import recall_all, capture_memory
+from memory_local import (
+    read_brain_context, read_recent_logs,
+    write_daily_log, write_error, write_learning,
+    detect_correction,
+)
+
+
+def _get_bot_open_id() -> str:
+    """调用飞书 API 获取 Bot 自身的 open_id"""
+    ctx = ssl.create_default_context()
+    # 先获取 tenant_access_token
+    token_body = json.dumps({
+        "app_id": config.FEISHU_APP_ID,
+        "app_secret": config.FEISHU_APP_SECRET,
+    }).encode()
+    token_req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        data=token_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+        token = json.loads(r.read())["tenant_access_token"]
+
+    # 获取 bot info
+    bot_req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/bot/v3/info",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(bot_req, context=ctx, timeout=10) as r:
+        data = json.loads(r.read())
+        return data["bot"]["open_id"]
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 
@@ -58,6 +93,14 @@ lark_client = lark.Client.builder() \
 feishu = FeishuClient(lark_client, app_id=config.FEISHU_APP_ID, app_secret=config.FEISHU_APP_SECRET)
 store = SessionStore()
 _active_runs = ActiveRunRegistry()
+
+# 启动时获取 bot 自己的 open_id，用于群聊中判断是否 @了自己
+try:
+    BOT_OPEN_ID = _get_bot_open_id()
+    print(f"[init] Bot open_id: {BOT_OPEN_ID}", flush=True)
+except Exception as e:
+    print(f"[warn] 获取 bot open_id 失败: {e}，群聊过滤将退化为响应所有 @", flush=True)
+    BOT_OPEN_ID = None
 
 # per-chat 消息队列锁，保证同一群组的消息串行处理，允许不同群组并发处理
 _chat_locks: dict[str, asyncio.Lock] = {}
@@ -140,11 +183,19 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
                 await feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
-    # 群聊只响应 @机器人 的消息
+    # 群聊只响应 @本机器人 的消息
     if is_group:
         mentions = getattr(msg, 'mentions', None) or []
         if not mentions:
             return  # 没有 @mention，忽略
+        # 检查是否 @了本 bot（而不是其他 bot）
+        if BOT_OPEN_ID:
+            mentioned_me = any(
+                getattr(getattr(m, 'id', None), 'open_id', None) == BOT_OPEN_ID
+                for m in mentions
+            )
+            if not mentioned_me:
+                return  # @的不是我，忽略
 
     # 获取该群组的队列锁，保证同一群组消息串行处理，不同群组可并发
     if chat_id not in _chat_locks:
@@ -177,12 +228,13 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
         if not text:
             return
 
-        # 群聊：去掉 @mention 占位符
+        # 群聊：只去掉 @本bot 的占位符，保留其他 @mention 内容
         if is_group:
             mentions = getattr(msg, 'mentions', None) or []
             for mention in mentions:
+                mention_open_id = getattr(getattr(mention, 'id', None), 'open_id', None)
                 key = getattr(mention, 'key', '')
-                if key:
+                if key and (not BOT_OPEN_ID or mention_open_id == BOT_OPEN_ID):
                     text = text.replace(key, '').strip()
             if not text:
                 return
@@ -233,6 +285,42 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     # ── 普通消息 → 调用 Claude ──────────────────────────────
     session = await store.get_current(user_id, chat_id)
     print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
+
+    # 0a. 群聊：拉取历史消息，让 cc 知道对话上下文
+    group_history = ""
+    if is_group:
+        try:
+            group_history = await feishu.fetch_group_history(
+                chat_id,
+                limit=50,
+                known_names=config.GROUP_KNOWN_NAMES,
+            )
+            if group_history:
+                print(f"[history] 注入群聊历史 {len(group_history)} 字符", flush=True)
+        except Exception as e:
+            print(f"[history] 拉取群聊历史失败: {e}", flush=True)
+
+    # 0b. 本地长期记忆（SOUL.md + MEMORY.md）注入
+    brain_context = ""
+    try:
+        brain_context = await asyncio.get_event_loop().run_in_executor(
+            None, read_brain_context
+        )
+        if brain_context:
+            print(f"[brain] 注入长期记忆 {len(brain_context)} 字符", flush=True)
+    except Exception as e:
+        print(f"[brain] 读取失败: {e}", flush=True)
+
+    # 0c. 召回共享记忆（mem0 + OpenClaw 本地知识库）
+    memory_context = ""
+    try:
+        memory_context = await asyncio.get_event_loop().run_in_executor(
+            None, recall_all, text
+        )
+        if memory_context:
+            print(f"[memory] 召回 {len(memory_context)} 字符上下文", flush=True)
+    except Exception as e:
+        print(f"[memory] recall 异常: {e}", flush=True)
 
     # 1. 发送"思考中"占位卡片，拿到 message_id
     try:
@@ -288,12 +376,18 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
     # 3. 运行 Claude
     claude_msg = text
+    if group_history:
+        claude_msg = claude_msg + group_history
+    if brain_context:
+        claude_msg = claude_msg + "\n" + brain_context
+    if memory_context:
+        claude_msg = claude_msg + "\n" + memory_context
     if not session.session_id:
         claude_msg = (
             "[环境：用户通过飞书发送消息，无交互式UI。"
             "当需要用户做选择时，用编号列表呈现选项（1. 2. 3.），"
             "最后加一个「其他（请说明）」选项，用户回复数字即可。"
-            "简单确认用 Y/N。]\n\n" + text
+            "简单确认用 Y/N。]\n\n" + claude_msg
         )
     try:
         print(f"[run_claude] 开始调用...", flush=True)
@@ -331,7 +425,57 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     except Exception as e:
         print(f"[error] 更新卡片失败: {e}", flush=True)
 
-    # 5. 更新 session 状态
+    # 5. 群聊中检测 @其他 Bot，发送真正的 @mention 消息
+    if is_group and full_text:
+        import re
+        for trigger, (bot_oid, bot_name) in config.GROUP_BOTS.items():
+            if trigger in full_text:
+                # 从 Claude 回复中提取 @Bot 后面的内容作为转发文本
+                # 去掉 Claude 回复中的 @触发词，剩余内容作为上下文
+                relay_text = full_text
+                for t in config.GROUP_BOTS:
+                    relay_text = relay_text.replace(t, "").strip()
+                # 截取合理长度作为转发
+                if len(relay_text) > 500:
+                    relay_text = relay_text[:500] + "..."
+                try:
+                    await feishu.send_at_message_to_group(
+                        chat_id, relay_text, bot_oid, bot_name
+                    )
+                    print(f"[at-bot] 已 @{bot_name} 转发消息", flush=True)
+                except Exception as e:
+                    print(f"[at-bot] @{bot_name} 失败: {e}", flush=True)
+                break  # 只触发一个 bot
+
+    # 6. 保存对话到共享记忆（后台执行，不阻塞）
+    if full_text:
+        try:
+            asyncio.get_event_loop().run_in_executor(
+                None, capture_memory, text, full_text
+            )
+        except Exception as e:
+            print(f"[memory] capture 异常: {e}", flush=True)
+
+    # 6b. 本地记忆：写日志 + 检测纠正
+    if full_text:
+        def _local_memory_tasks():
+            try:
+                # 写每日日志（只记录有实质内容的对话）
+                if len(full_text) > 50:
+                    log_entry = f"用户：{text[:200]}\nClaude：{full_text[:400]}"
+                    write_daily_log(log_entry, tag="对话")
+                # 检测纠正信号 → 写 ERRORS.md
+                if detect_correction(text):
+                    write_error(
+                        user_msg=text[:100],
+                        wrong_behavior="待分析（用户发出了纠正信号）",
+                        correction=text[:200],
+                    )
+            except Exception as e:
+                print(f"[brain] 本地记忆写入失败: {e}", flush=True)
+        asyncio.get_event_loop().run_in_executor(None, _local_memory_tasks)
+
+    # 7. 更新 session 状态
     if new_session_id:
         await store.on_claude_response(user_id, chat_id, new_session_id, text)
 
@@ -399,6 +543,35 @@ def main():
     # 启动看门狗线程
     t = threading.Thread(target=_watchdog, daemon=True)
     t.start()
+
+    # 启动定时任务调度器
+    from scheduler import run_scheduler
+
+    async def _scheduler_trigger(chat_id: str, task_prompt: str):
+        """定时任务触发：调用 Claude 并把结果发到对应 chat"""
+        try:
+            session = await store.get_current("__scheduler__", chat_id)
+            card_msg_id = await feishu.send_card_to_user(chat_id, loading=True)
+            full_text, new_session_id, _ = await run_claude(
+                message=task_prompt,
+                session_id=session.session_id,
+                model=session.model,
+                cwd=session.cwd,
+                permission_mode=session.permission_mode,
+            )
+            await feishu.update_card(card_msg_id, full_text or "（定时任务无输出）")
+            if new_session_id:
+                await store.on_claude_response("__scheduler__", chat_id, new_session_id, task_prompt)
+        except Exception as e:
+            print(f"[scheduler_trigger] 失败: {e}", flush=True)
+
+    def _start_scheduler():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_scheduler(_scheduler_trigger))
+
+    sched_thread = threading.Thread(target=_start_scheduler, daemon=True)
+    sched_thread.start()
 
     print("✅ 连接飞书 WebSocket 长连接（自动重连）...")
     ws_client.start()  # 阻塞，内部运行 asyncio loop

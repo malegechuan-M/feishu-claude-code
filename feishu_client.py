@@ -247,3 +247,125 @@ class FeishuClient:
         if not resp.success():
             raise RuntimeError(f"发送文本消息失败: {resp.code} {resp.msg}")
         return resp.data.message_id
+
+    async def fetch_group_history(
+        self,
+        chat_id: str,
+        limit: int = 20,
+        known_names: dict[str, str] | None = None,
+    ) -> str:
+        """
+        拉取群聊最近 N 条消息，格式化为对话历史文本。
+        known_names: {open_id: 显示名} 映射，用于标注发言者。
+        返回可直接注入 Claude 上下文的字符串，空群返回 ""。
+        """
+        import ssl, urllib.request, urllib.parse
+
+        known_names = known_names or {}
+        ctx = ssl.create_default_context()
+
+        # 1. 获取 tenant_access_token
+        token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
+        token_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=token_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        loop = asyncio.get_event_loop()
+
+        def _http(req):
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                return json.loads(r.read())
+
+        token_data = await loop.run_in_executor(None, _http, token_req)
+        token = token_data.get("tenant_access_token", "")
+        if not token:
+            return ""
+
+        # 2. 拉取消息列表（倒序，最新在前）
+        params = urllib.parse.urlencode({
+            "container_id_type": "chat",
+            "container_id": chat_id,
+            "sort_type": "ByCreateTimeDesc",
+            "page_size": limit,
+        })
+        msg_req = urllib.request.Request(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?{params}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        msg_data = await loop.run_in_executor(None, _http, msg_req)
+        items = msg_data.get("data", {}).get("items", [])
+        if not items:
+            return ""
+
+        # 3. 解析并格式化（倒序→正序）
+        lines = []
+        for item in reversed(items):
+            sender_id = item.get("sender", {}).get("id", "")
+            msg_type = item.get("msg_type", "")
+            raw_content = item.get("body", {}).get("content", "")
+
+            # 只处理文本和卡片（跳过图片、文件等）
+            text_content = ""
+            if msg_type == "text":
+                try:
+                    text_content = json.loads(raw_content).get("text", "").strip()
+                except Exception:
+                    text_content = raw_content.strip()
+            elif msg_type == "interactive":
+                # 卡片消息（Bot 回复）：提取 markdown 内容
+                try:
+                    card = json.loads(raw_content)
+                    parts = []
+                    for el in card.get("body", {}).get("elements", []):
+                        if el.get("tag") == "markdown":
+                            parts.append(el.get("content", ""))
+                    text_content = "\n".join(parts).strip()
+                    # 跳过纯"思考中"占位卡片
+                    if text_content in ("⏳ 思考中...", ""):
+                        continue
+                except Exception:
+                    continue
+            else:
+                continue
+
+            if not text_content:
+                continue
+
+            # 截断过长消息
+            if len(text_content) > 1000:
+                text_content = text_content[:1000] + "…"
+
+            name = known_names.get(sender_id, sender_id[:8] if sender_id else "未知")
+            lines.append(f"{name}: {text_content}")
+
+        if not lines:
+            return ""
+
+        history_text = "\n".join(lines)
+        return (
+            f"\n\n---\n[群聊最近 {len(lines)} 条消息记录]\n"
+            f"{history_text}\n---\n"
+        )
+
+    async def send_at_message_to_group(self, chat_id: str, text: str, at_open_id: str, at_name: str) -> str:
+        """向群聊发送带 @mention 的文本消息（真正的 @，会触发对方的消息事件）"""
+        # 飞书文本消息中 @mention 的格式
+        at_text = f'<at user_id="{at_open_id}">{at_name}</at> {text}'
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(json.dumps({"text": at_text}))
+                .build()
+            )
+            .build()
+        )
+        resp = await self.client.im.v1.message.acreate(req)
+        if not resp.success():
+            raise RuntimeError(f"发送 @mention 消息失败: {resp.code} {resp.msg}")
+        return resp.data.message_id
