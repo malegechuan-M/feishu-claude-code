@@ -33,6 +33,119 @@ from memory_local import (
     write_daily_log, write_error, write_learning,
     detect_correction,
 )
+from collections import deque
+
+# ── 群聊实时消息缓存（WebSocket 推送，有真实卡片内容）────────────
+# API 拉历史时卡片内容被飞书降级为占位符，实时推送有原始内容
+_group_histories: dict[str, deque] = {}
+GROUP_HISTORY_MAX = 50  # 每个群保留最近 N 条
+_CACHE_FILE = os.path.expanduser("~/.feishu-claude/group_history_cache.json")
+
+
+def _save_group_cache():
+    """把群聊缓存持久化到文件"""
+    try:
+        data = {chat_id: list(buf) for chat_id, buf in _group_histories.items()}
+        os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
+        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[cache] 保存群聊缓存失败: {e}", flush=True)
+
+
+def _load_group_cache():
+    """启动时从文件恢复群聊缓存"""
+    try:
+        if not os.path.exists(_CACHE_FILE):
+            return
+        with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for chat_id, entries in data.items():
+            _group_histories[chat_id] = deque(entries, maxlen=GROUP_HISTORY_MAX)
+        total = sum(len(v) for v in _group_histories.values())
+        print(f"[cache] 恢复群聊缓存：{len(_group_histories)} 个群，共 {total} 条消息", flush=True)
+    except Exception as e:
+        print(f"[cache] 读取群聊缓存失败: {e}", flush=True)
+
+
+def _parse_event_content(msg) -> str:
+    """从 WebSocket 事件解析消息文本（支持 text / post / interactive 卡片）"""
+    if msg.message_type == "text":
+        try:
+            return json.loads(msg.content).get("text", "").strip()
+        except Exception:
+            return ""
+    elif msg.message_type == "post":
+        try:
+            post = json.loads(msg.content)
+            parts = []
+            for block in post.get("zh_cn", {}).get("content", []):
+                for el in block:
+                    t = el.get("text") or el.get("content", "")
+                    if t:
+                        parts.append(t)
+            return "\n".join(parts).strip()
+        except Exception:
+            return ""
+    elif msg.message_type == "interactive":
+        try:
+            card = json.loads(msg.content)
+            parts = []
+            if card.get("schema") == "2.0":
+                # Card JSON 2.0（Claude bot 格式）
+                for el in card.get("body", {}).get("elements", []):
+                    if el.get("tag") == "markdown":
+                        parts.append(el.get("content", ""))
+            else:
+                # 旧版 Card Kit（OpenClaw 格式）
+                header = card.get("header", {})
+                title = header.get("title", {})
+                if isinstance(title, dict) and title.get("content"):
+                    parts.append(f"**{title['content']}**")
+                for el in card.get("elements", []):
+                    sub_els = el if isinstance(el, list) else [el]
+                    for sub in sub_els:
+                        tag = sub.get("tag", "")
+                        if tag == "markdown":
+                            parts.append(sub.get("content", ""))
+                        elif tag in ("div", "section"):
+                            text_obj = sub.get("text", {})
+                            if isinstance(text_obj, dict):
+                                parts.append(text_obj.get("content", ""))
+                        elif tag == "text":
+                            t = sub.get("text", "")
+                            if t and t != "请升级至最新版本客户端，以查看内容":
+                                parts.append(t)
+            text = "\n".join(p for p in parts if p).strip()
+            return text if text not in ("⏳ 思考中...", "") else ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _record_group_msg(chat_id: str, sender_name: str, content: str):
+    """记录一条群消息到内存缓存，并异步持久化"""
+    if not content:
+        return
+    if chat_id not in _group_histories:
+        _group_histories[chat_id] = deque(maxlen=GROUP_HISTORY_MAX)
+    _group_histories[chat_id].append((sender_name, content[:800]))
+    # 每10条持久化一次（避免每条都写文件）
+    if len(_group_histories[chat_id]) % 10 == 0:
+        _save_group_cache()
+
+
+def _get_group_history_text(chat_id: str) -> str:
+    """获取格式化的群聊历史文本"""
+    buf = _group_histories.get(chat_id)
+    if not buf:
+        return ""
+    lines = [f"{name}: {content}" for name, content in buf]
+    return (
+        f"\n\n---\n[群聊最近 {len(lines)} 条消息记录（实时）]\n"
+        + "\n".join(lines)
+        + "\n---\n"
+    )
 
 
 def _get_bot_open_id() -> str:
@@ -63,7 +176,7 @@ def _get_bot_open_id() -> str:
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 
-MAX_UPTIME = 4 * 3600   # 最长运行 4 小时后主动重启
+MAX_UPTIME = 24 * 3600   # 最长运行 24 小时后主动重启
 _start_time = time.time()
 _last_event = time.time()
 
@@ -77,6 +190,7 @@ def _watchdog():
 
         if uptime > MAX_UPTIME:
             print(f"[watchdog] 运行 {uptime/3600:.1f}h，定时重启刷新连接", flush=True)
+            _save_group_cache()
             os._exit(0)
 
         print(f"[watchdog] uptime={uptime/3600:.1f}h idle={idle/60:.0f}min", flush=True)
@@ -183,19 +297,25 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
                 await feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
-    # 群聊只响应 @本机器人 的消息
+    # 群聊消息处理：非 @我 的消息记录到实时缓存
     if is_group:
         mentions = getattr(msg, 'mentions', None) or []
-        if not mentions:
-            return  # 没有 @mention，忽略
-        # 检查是否 @了本 bot（而不是其他 bot）
-        if BOT_OPEN_ID:
+        mentioned_me = False
+        if BOT_OPEN_ID and mentions:
             mentioned_me = any(
                 getattr(getattr(m, 'id', None), 'open_id', None) == BOT_OPEN_ID
                 for m in mentions
             )
-            if not mentioned_me:
-                return  # @的不是我，忽略
+        elif not BOT_OPEN_ID and mentions:
+            mentioned_me = True  # 降级：有 @mention 就响应
+
+        if not mentioned_me:
+            # 不是 @我：解析内容并记录到群聊历史缓存
+            content = _parse_event_content(msg)
+            sender_name = config.GROUP_KNOWN_NAMES.get(user_id, user_id[:8] if user_id else "未知")
+            _record_group_msg(chat_id, sender_name, content)
+            print(f"[group cache] 记录消息 chat={chat_id[:8]} sender={sender_name} len={len(content)}", flush=True)
+            return  # 不是@我，不调用 Claude
 
     # 获取该群组的队列锁，保证同一群组消息串行处理，不同群组可并发
     if chat_id not in _chat_locks:
@@ -286,19 +406,19 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     session = await store.get_current(user_id, chat_id)
     print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
 
-    # 0a. 群聊：拉取历史消息，让 cc 知道对话上下文
+    # 0a. 群聊：从实时内存缓存注入历史（WebSocket 推送有真实卡片内容）
     group_history = ""
     if is_group:
-        try:
-            group_history = await feishu.fetch_group_history(
-                chat_id,
-                limit=50,
-                known_names=config.GROUP_KNOWN_NAMES,
-            )
-            if group_history:
-                print(f"[history] 注入群聊历史 {len(group_history)} 字符", flush=True)
-        except Exception as e:
-            print(f"[history] 拉取群聊历史失败: {e}", flush=True)
+        # 先把本条 @我 的消息也记一下（保持历史连贯）
+        my_content = _parse_event_content(msg)
+        sender_name = config.GROUP_KNOWN_NAMES.get(user_id, user_id[:8] if user_id else "用户")
+        _record_group_msg(chat_id, sender_name, my_content)
+
+        group_history = _get_group_history_text(chat_id)
+        if group_history:
+            print(f"[history] 注入群聊历史 {len(group_history)} 字符（实时缓存 {len(_group_histories.get(chat_id, []))} 条）", flush=True)
+        else:
+            print(f"[history] 群聊历史缓存为空（Bot 刚启动或无历史消息）", flush=True)
 
     # 0b. 本地长期记忆（SOUL.md + MEMORY.md）注入
     brain_context = ""
@@ -523,6 +643,8 @@ def on_message_receive(data: P2ImMessageReceiveV1) -> None:
 # ── 启动 ──────────────────────────────────────────────────────
 
 def main():
+    # 启动时恢复群聊缓存
+    _load_group_cache()
     print("🚀 飞书 Claude Bot 启动中...")
     print(f"   App ID      : {config.FEISHU_APP_ID}")
     print(f"   默认模型    : {config.DEFAULT_MODEL}")

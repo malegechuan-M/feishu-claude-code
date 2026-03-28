@@ -16,77 +16,55 @@ from lark_oapi.api.im.v1.model import (
     CreateMessageRequestBody,
     PatchMessageRequest,
     PatchMessageRequestBody,
+    UpdateMessageRequest,
+    UpdateMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
 
 
-def _card_json(content: str, loading: bool = False) -> str:
+def _post_json(content: str, loading: bool = False) -> str:
     """
-    生成卡片 JSON 字符串（Card JSON 2.0）
+    生成飞书 post（富文本）JSON 字符串。
+    post 格式 API 完全可读，其他 Bot 拉历史时能看到完整内容。
+    支持 markdown（代码块、加粗、链接等），超长时自动分段。
+    """
+    text = "⏳ 思考中..." if loading else content
 
-    飞书卡片 markdown 元素有长度限制（约 3000 字符），
-    超过限制时自动分段为多个 markdown 元素。
-    """
-    elements = []
-    if loading:
-        elements.append({"tag": "markdown", "content": "⏳ 思考中..."})
+    # post 消息单个 md 块限制约 4000 字符
+    MAX_CHUNK_SIZE = 3800
+
+    if len(text) <= MAX_CHUNK_SIZE:
+        chunks = [text]
     else:
-        # 飞书 markdown 元素长度限制约 3000 字符，保守使用 2800
-        MAX_CHUNK_SIZE = 2800
+        chunks = []
+        current_chunk = ""
+        for line in text.split('\n'):
+            if len(line) > MAX_CHUNK_SIZE:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                    current_chunk = ""
+                for i in range(0, len(line), MAX_CHUNK_SIZE):
+                    chunks.append(line[i:i + MAX_CHUNK_SIZE])
+                continue
+            if len(current_chunk) + len(line) + 1 > MAX_CHUNK_SIZE:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk = current_chunk + '\n' + line if current_chunk else line
+        if current_chunk:
+            chunks.append(current_chunk)
 
-        if len(content) <= MAX_CHUNK_SIZE:
-            # 内容不长，直接发送
-            elements.append({"tag": "markdown", "content": content})
-        else:
-            # 内容过长，分段发送
-            # 尝试按段落分割，避免在句子中间截断
-            chunks = []
-            current_chunk = ""
-
-            # 按换行符分割
-            lines = content.split('\n')
-
-            for line in lines:
-                # 如果单行就超过限制，强制截断
-                if len(line) > MAX_CHUNK_SIZE:
-                    # 先保存当前块
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                        current_chunk = ""
-
-                    # 强制分割长行
-                    for i in range(0, len(line), MAX_CHUNK_SIZE):
-                        chunks.append(line[i:i + MAX_CHUNK_SIZE])
-                    continue
-
-                # 检查加上这行是否会超过限制
-                if len(current_chunk) + len(line) + 1 > MAX_CHUNK_SIZE:
-                    # 超过限制，保存当前块，开始新块
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                    current_chunk = line
-                else:
-                    # 未超过限制，追加到当前块
-                    if current_chunk:
-                        current_chunk += '\n' + line
-                    else:
-                        current_chunk = line
-
-            # 保存最后一块
-            if current_chunk:
-                chunks.append(current_chunk)
-
-            # 为每个块创建 markdown 元素
-            for i, chunk in enumerate(chunks):
-                # 第一块不加前缀，后续块加分段标记
-                if i > 0:
-                    chunk = f"**（续 {i}）**\n\n{chunk}"
-                elements.append({"tag": "markdown", "content": chunk})
+    # 多段时加续篇标记
+    content_blocks = []
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            chunk = f"**（续 {i}）**\n\n{chunk}"
+        content_blocks.append([{"tag": "md", "text": chunk}])
 
     return json.dumps({
-        "schema": "2.0",
-        "body": {"elements": elements},
+        "zh_cn": {"content": content_blocks}
     }, ensure_ascii=False)
 
 
@@ -131,7 +109,7 @@ class FeishuClient:
     # ── 发送消息 ──────────────────────────────────────────────
 
     async def send_card_to_user(self, open_id: str, content: str = "", loading: bool = True) -> str:
-        """向用户发送卡片消息，返回 message_id（带重试）"""
+        """向用户发送 post 富文本消息，返回 message_id（带重试）"""
         async def _send():
             req = (
                 CreateMessageRequest.builder()
@@ -139,56 +117,57 @@ class FeishuClient:
                 .request_body(
                     CreateMessageRequestBody.builder()
                     .receive_id(open_id)
-                    .msg_type("interactive")
-                    .content(_card_json(content, loading=loading))
+                    .msg_type("post")
+                    .content(_post_json(content, loading=loading))
                     .build()
                 )
                 .build()
             )
             resp = await self.client.im.v1.message.acreate(req)
             if not resp.success():
-                raise RuntimeError(f"发送卡片消息失败: {resp.code} {resp.msg}")
+                raise RuntimeError(f"发送消息失败: {resp.code} {resp.msg}")
             return resp.data.message_id
 
         return await self._retry_with_backoff(_send, max_retries=3)
 
     async def reply_card(self, message_id: str, content: str = "", loading: bool = True) -> str:
-        """回复用户消息（卡片形式），触发通知。返回回复消息的 message_id（带重试）"""
+        """回复用户消息（post 富文本），触发通知。返回回复消息的 message_id（带重试）"""
         async def _reply():
             req = (
                 ReplyMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(
                     ReplyMessageRequestBody.builder()
-                    .msg_type("interactive")
-                    .content(_card_json(content, loading=loading))
+                    .msg_type("post")
+                    .content(_post_json(content, loading=loading))
                     .build()
                 )
                 .build()
             )
             resp = await self.client.im.v1.message.areply(req)
             if not resp.success():
-                raise RuntimeError(f"回复卡片消息失败: {resp.code} {resp.msg}")
+                raise RuntimeError(f"回复消息失败: {resp.code} {resp.msg}")
             return resp.data.message_id
 
         return await self._retry_with_backoff(_reply, max_retries=3)
 
     async def update_card(self, message_id: str, content: str):
-        """用 patch 更新已发送的卡片内容（带重试）"""
+        """用 update（PUT）更新已发送的 post 消息内容（带重试）"""
         async def _update():
             req = (
-                PatchMessageRequest.builder()
+                UpdateMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(
-                    PatchMessageRequestBody.builder()
-                    .content(_card_json(content, loading=False))
+                    UpdateMessageRequestBody.builder()
+                    .msg_type("post")
+                    .content(_post_json(content, loading=False))
                     .build()
                 )
                 .build()
             )
-            resp = await self.client.im.v1.message.apatch(req)
+            resp = await self.client.im.v1.message.aupdate(req)
             if not resp.success():
-                raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
+                raise RuntimeError(f"update 消息失败: {resp.code} {resp.msg}")
 
         try:
             await self._retry_with_backoff(_update, max_retries=3)
@@ -251,7 +230,7 @@ class FeishuClient:
     async def fetch_group_history(
         self,
         chat_id: str,
-        limit: int = 20,
+        limit: int = 30,
         known_names: dict[str, str] | None = None,
     ) -> str:
         """
@@ -284,11 +263,13 @@ class FeishuClient:
             return ""
 
         # 2. 拉取消息列表（倒序，最新在前）
+        # 飞书 API page_size 最大 50
+        fetch_size = min(limit * 2, 50)
         params = urllib.parse.urlencode({
             "container_id_type": "chat",
             "container_id": chat_id,
             "sort_type": "ByCreateTimeDesc",
-            "page_size": limit,
+            "page_size": fetch_size,
         })
         msg_req = urllib.request.Request(
             f"https://open.feishu.cn/open-apis/im/v1/messages?{params}",
@@ -306,27 +287,73 @@ class FeishuClient:
             msg_type = item.get("msg_type", "")
             raw_content = item.get("body", {}).get("content", "")
 
-            # 只处理文本和卡片（跳过图片、文件等）
+            # 只处理文本、post 富文本和卡片（跳过图片、文件等）
             text_content = ""
             if msg_type == "text":
                 try:
                     text_content = json.loads(raw_content).get("text", "").strip()
                 except Exception:
                     text_content = raw_content.strip()
+            elif msg_type == "post":
+                # post 富文本（OpenClaw raw 模式 / Claude Bot 新格式）
+                try:
+                    post = json.loads(raw_content)
+                    parts = []
+                    for block in post.get("zh_cn", {}).get("content", []):
+                        for el in block:
+                            t = el.get("text") or el.get("content", "")
+                            if t:
+                                parts.append(t)
+                    text_content = "\n".join(parts).strip()
+                except Exception:
+                    text_content = raw_content.strip()
             elif msg_type == "interactive":
                 # 卡片消息（Bot 回复）：提取 markdown 内容
+                # 支持 Card JSON 2.0（schema:2.0）和旧版 Card Kit 1.0
                 try:
                     card = json.loads(raw_content)
                     parts = []
-                    for el in card.get("body", {}).get("elements", []):
-                        if el.get("tag") == "markdown":
-                            parts.append(el.get("content", ""))
-                    text_content = "\n".join(parts).strip()
-                    # 跳过纯"思考中"占位卡片
+
+                    if card.get("schema") == "2.0":
+                        # 新版 Card JSON 2.0（Claude bot 格式）
+                        for el in card.get("body", {}).get("elements", []):
+                            if el.get("tag") == "markdown":
+                                parts.append(el.get("content", ""))
+                    else:
+                        # 旧版 Card Kit 1.0（OpenClaw / 其他 bot 格式）
+                        # header title
+                        header = card.get("header", {})
+                        title = header.get("title", {})
+                        if isinstance(title, dict) and title.get("content"):
+                            parts.append(f"**{title['content']}**")
+                        # elements 可能是一维或二维数组
+                        for el in card.get("elements", []):
+                            if isinstance(el, list):
+                                sub_els = el
+                            else:
+                                sub_els = [el]
+                            for sub in sub_els:
+                                tag = sub.get("tag", "")
+                                if tag == "markdown":
+                                    parts.append(sub.get("content", ""))
+                                elif tag in ("div", "section"):
+                                    text_obj = sub.get("text", {})
+                                    if isinstance(text_obj, dict):
+                                        parts.append(text_obj.get("content", ""))
+                                    # fields 数组
+                                    for field in sub.get("fields", []):
+                                        if isinstance(field, dict):
+                                            t = field.get("text", {})
+                                            if isinstance(t, dict):
+                                                parts.append(t.get("content", ""))
+
+                    text_content = "\n".join(p for p in parts if p).strip()
+                    # 跳过纯"思考中"占位卡片或空卡片
                     if text_content in ("⏳ 思考中...", ""):
                         continue
                 except Exception:
-                    continue
+                    # 解析失败：标记为"卡片消息"，不静默丢弃
+                    text_content = "[卡片消息]"
             else:
                 continue
 
@@ -343,6 +370,8 @@ class FeishuClient:
         if not lines:
             return ""
 
+        # 截取到目标数量（多拉的原始消息经过过滤后取前 limit 条）
+        lines = lines[-limit:]
         history_text = "\n".join(lines)
         return (
             f"\n\n---\n[群聊最近 {len(lines)} 条消息记录]\n"
