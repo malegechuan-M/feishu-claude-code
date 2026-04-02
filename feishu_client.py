@@ -151,8 +151,24 @@ class FeishuClient:
 
         return await self._retry_with_backoff(_reply, max_retries=3)
 
+    # 飞书 post 消息体上限约 30KB，安全阈值设为 25000 字符
+    MAX_UPDATE_CHARS = 25000
+
+    # 记录已降级的 message_id，防止重复 reply
+    _reply_fallback_sent: set = set()
+
     async def update_card(self, message_id: str, content: str):
-        """用 update（PUT）更新已发送的 post 消息内容（带重试）"""
+        """用 update（PUT）更新已发送的 post 消息内容。
+        超长时自动截断；update 失败时降级为 reply（仅一次）。"""
+        # 超长截断
+        if len(content) > self.MAX_UPDATE_CHARS:
+            content = content[:self.MAX_UPDATE_CHARS] + "\n\n⚠️ *（消息过长，已截断）*"
+            print(f"[warn] 消息超长，已截断至 {self.MAX_UPDATE_CHARS} 字符", flush=True)
+
+        class _PermanentError(Exception):
+            """不可重试的永久性错误"""
+            pass
+
         async def _update():
             req = (
                 UpdateMessageRequest.builder()
@@ -167,12 +183,27 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.aupdate(req)
             if not resp.success():
+                # 230072 = 编辑次数上限，重试无意义
+                if resp.code == 230072:
+                    raise _PermanentError(f"编辑次数上限: {resp.msg}")
                 raise RuntimeError(f"update 消息失败: {resp.code} {resp.msg}")
 
         try:
-            await self._retry_with_backoff(_update, max_retries=3)
+            await self._retry_with_backoff(_update, max_retries=2)
         except Exception as e:
-            print(f"[warn] 更新卡片最终失败: {e}", flush=True)
+            # 降级：reply 一条新消息，但同一个 message_id 只降级一次
+            if message_id in self._reply_fallback_sent:
+                print(f"[warn] update 失败且已降级过，跳过: {e}", flush=True)
+                return
+            self._reply_fallback_sent.add(message_id)
+            # 防止集合无限增长
+            if len(self._reply_fallback_sent) > 100:
+                self._reply_fallback_sent = set(list(self._reply_fallback_sent)[-50:])
+            print(f"[warn] update 失败，reply 降级（仅一次）: {e}", flush=True)
+            try:
+                await self.reply_card(message_id, content=content[:self.MAX_UPDATE_CHARS], loading=False)
+            except Exception as e2:
+                print(f"[error] reply 降级也失败: {e2}", flush=True)
 
     async def download_image(self, message_id: str, image_key: str) -> str:
         """下载飞书图片到临时文件，返回本地路径"""
@@ -207,6 +238,28 @@ class FeishuClient:
                 f.write(r.read())
 
         return tmp_path
+
+    async def send_card_to_group(self, chat_id: str, content: str = "", loading: bool = False) -> str:
+        """向群聊发送 post 富文本消息，返回 message_id（带重试）"""
+        async def _send():
+            req = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("post")
+                    .content(_post_json(content, loading=loading))
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.acreate(req)
+            if not resp.success():
+                raise RuntimeError(f"发送群消息失败: {resp.code} {resp.msg}")
+            return resp.data.message_id
+
+        return await self._retry_with_backoff(_send, max_retries=3)
 
     async def send_text_to_user(self, open_id: str, text: str) -> str:
         """发送纯文本消息"""
@@ -361,8 +414,8 @@ class FeishuClient:
                 continue
 
             # 截断过长消息
-            if len(text_content) > 1000:
-                text_content = text_content[:1000] + "…"
+            if len(text_content) > 3000:
+                text_content = text_content[:3000] + "…"
 
             name = known_names.get(sender_id, sender_id[:8] if sender_id else "未知")
             lines.append(f"{name}: {text_content}")
@@ -398,3 +451,50 @@ class FeishuClient:
         if not resp.success():
             raise RuntimeError(f"发送 @mention 消息失败: {resp.code} {resp.msg}")
         return resp.data.message_id
+
+    def _get_tenant_token(self) -> str:
+        """同步获取 tenant_access_token，供非异步方法使用"""
+        import ssl
+        import urllib.request
+        try:
+            ctx = ssl.create_default_context()
+            token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
+            token_req = urllib.request.Request(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                data=token_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+                return json.loads(r.read()).get("tenant_access_token", "")
+        except Exception as e:
+            print(f"[feishu] _get_tenant_token 失败: {e}", flush=True)
+            return ""
+
+    def get_user_info(self, open_id: str) -> dict | None:
+        """通过飞书 API 获取用户基本信息（姓名等）"""
+        try:
+            import urllib.request
+            import ssl
+
+            token = self._get_tenant_token()
+            if not token:
+                return None
+
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(
+                f"https://open.feishu.cn/open-apis/contact/v3/users/{open_id}?user_id_type=open_id",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, context=ctx) as resp:
+                data = json.loads(resp.read())
+                if data.get("code") == 0 and data.get("data", {}).get("user"):
+                    user = data["data"]["user"]
+                    return {"name": user.get("name", ""), "avatar": user.get("avatar", {}).get("avatar_72", "")}
+            return None
+        except Exception as e:
+            print(f"[feishu] get_user_info 失败: {e}", flush=True)
+            return None

@@ -30,6 +30,23 @@ GROUP_KNOWN_NAMES: dict[str, str] = {
 # 格式: {触发关键词: (open_id, 显示名)}
 # Claude 回复中包含触发关键词时，自动向对应 Bot 发送 @mention 消息
 GROUP_BOTS = {
-    # 示例：
-    # "@BotB": ("ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "BotB"),
+    "@麦克斯": ("ou_5a39f813fbd735f6095173bf12d56527", "麦克斯"),
+    "@M": ("ou_5a39f813fbd735f6095173bf12d56527", "麦克斯"),
+    "@openclaw": ("ou_5a39f813fbd735f6095173bf12d56527", "麦克斯"),
 }
+
+# OpenClaw 本地协同：触发关键词 → (agent_id, 飞书群 chat_id 映射)
+# CC bot 通过 openclaw CLI 直接调用 agent，结果由 OpenClaw 自己投递到飞书群
+OPENCLAW_AGENTS = {
+    "@麦克斯": "agent-a-coo",
+    "@M": "agent-a-coo",
+    "@openclaw": "agent-a-coo",
+}
+
+# 群聊 chat_id → OpenClaw reply-to target 的映射
+OPENCLAW_GROUP_TARGETS = {
+    "oc_ff3d17ce731af0fd8c015e16f321760d": "group:oc_ff3d17ce731af0fd8c015e16f321760d",
+    "oc_8743c4c9b397a56575d57ccf9ab45eed": "group:oc_8743c4c9b397a56575d57ccf9ab45eed",
+}
+
+OPENCLAW_CLI = os.getenv("OPENCLAW_CLI", "openclaw")
