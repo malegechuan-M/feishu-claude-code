@@ -1109,41 +1109,60 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         result_text = proc.stdout[:2000] if proc.stdout else ""
                     return (result_text, result_obj, oc_model)
 
-                async def _call_claude(prompt, effort="low"):
-                    """调用 Claude 并返回文本结果，失败返回 None"""
+                # 复杂度标记，由 _classify_mode 设置
+                _task_complexity = "simple"  # simple → Sonnet, complex → Opus
+
+                async def _call_claude(prompt, effort="low", force_opus=False):
+                    """调用 Claude 并返回文本结果，复杂任务自动升级 Opus"""
+                    model = "claude-opus-4-6" if (force_opus or _task_complexity == "complex") else "claude-sonnet-4-6"
+                    # 复杂任务 effort 也相应提升
+                    if model == "claude-opus-4-6" and effort == "low":
+                        effort = "medium"
                     try:
                         result, _, _ = await run_claude(
                             message=prompt,
-                            model="claude-sonnet-4-6",
+                            model=model,
                             effort=effort,
                         )
+                        print(f"[openclaw] Claude 调用完成, model={model}", flush=True)
                         return result.strip()
                     except Exception as e:
-                        print(f"[openclaw] Claude 调用失败: {e}", flush=True)
+                        print(f"[openclaw] Claude 调用失败 ({model}): {e}", flush=True)
                         return None
 
-                # ── 模式判断 ──
+                # ── 模式 + 复杂度判断（一次 Haiku 调用） ──
 
                 async def _classify_mode():
-                    """用 Haiku API 轻量判断「工作」还是「讨论」模式（省 token）"""
+                    """用 Haiku API 同时判断模式和复杂度"""
+                    nonlocal _task_complexity
                     try:
                         result = await chat_haiku(
                             messages=[{
                                 "role": "user",
                                 "content": (
-                                    f"判断意图，只回复 TASK 或 DISCUSS：\n"
+                                    f"判断以下内容的两个属性，用一行回复，格式：MODE COMPLEXITY\n\n"
+                                    f"MODE（二选一）：\n"
                                     f"- TASK：执行任务、查数据、做事情\n"
                                     f"- DISCUSS：讨论、分析、辩论、评估\n\n"
-                                    f"{relay_text[:300]}"
+                                    f"COMPLEXITY（二选一）：\n"
+                                    f"- SIMPLE：简单查询、日常任务、单一问题\n"
+                                    f"- COMPLEX：多维度分析、商业决策、战略评估、需要深度推理\n\n"
+                                    f"内容：{relay_text[:300]}\n\n"
+                                    f"只回复两个词，如：TASK SIMPLE 或 DISCUSS COMPLEX"
                                 ),
                             }],
                             max_tokens=10,
                             temperature=0.0,
                         )
-                        if result and "DISCUSS" in result.upper():
-                            return "discuss"
+                        if result:
+                            upper = result.upper()
+                            if "COMPLEX" in upper:
+                                _task_complexity = "complex"
+                                print(f"[openclaw] 复杂度: complex → 使用 Opus", flush=True)
+                            mode = "discuss" if "DISCUSS" in upper else "task"
+                            return mode
                     except Exception as e:
-                        print(f"[openclaw] Haiku 分类失败，默认 task: {e}", flush=True)
+                        print(f"[openclaw] Haiku 分类失败，默认 task/simple: {e}", flush=True)
                     return "task"
 
                 # ── 工作模式：派发 → 验收 → 返工 ──
