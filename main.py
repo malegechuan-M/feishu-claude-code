@@ -1148,7 +1148,8 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         f"- 如果涉及流程优化、自动化 → 考虑调用 agent-e-workflow\n"
                         f"- 如果涉及合规、法务 → 考虑调用 agent-f-legal\n"
                         f"- 如果是简单问答或你能直接完成的 → 直接回复即可\n"
-                        f"请根据任务复杂度自行决定是否需要子 agent 协助。"
+                        f"请根据任务复杂度自行决定是否需要子 agent 协助。\n\n"
+                        f"[格式要求] 回复开头必须加标注：「[麦克斯 → Claude] 等待 Claude 验收」"
                     )
                     agent_id = _matched_agent
 
@@ -1158,7 +1159,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
                         oc_result = await _call_oc(agent_id, task_desc)
                         if not oc_result or not oc_result[0].strip():
-                            await feishu.send_card_to_group(chat_id, f"⚠️ 麦克斯返回空结果（{round_label}），停止协同")
+                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 麦克斯返回空结果（{round_label}），停止协同")
                             return
                         result_text, result_obj, oc_model = oc_result
 
@@ -1174,15 +1175,19 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                             f"严格按格式回复，第一行必须是 PASS 或 REVISE"
                         )
                         if not review:
-                            await feishu.send_card_to_group(chat_id, f"⚠️ 验收环节出错（{round_label}）")
+                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 验收环节出错（{round_label}）")
                             return
 
                         is_pass = review.upper().startswith("PASS")
                         verdict_icon = "✅" if is_pass else "🔄"
                         model_line = f"📎 验收: claude-sonnet-4-6 | 执行: {oc_model or '未知'}"
+                        if is_pass:
+                            direction = "[Claude → 老大] 验收完成，请老大过目"
+                        else:
+                            direction = "[Claude → 麦克斯] 验收不通过，等待麦克斯返工"
                         await feishu.send_card_to_group(
                             chat_id,
-                            f"**{verdict_icon} Claude 验收（{round_label}）**\n{model_line}\n\n{review[:2000]}"
+                            f"{direction}\n**{verdict_icon} Claude 验收（{round_label}）**\n{model_line}\n\n{review[:2000]}"
                         )
                         print(f"[openclaw][工作] 验收: {'PASS' if is_pass else 'REVISE'}", flush=True)
 
@@ -1190,7 +1195,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                             return
 
                         if round_n >= OPENCLAW_MAX_ROUNDS:
-                            await feishu.send_card_to_group(chat_id, f"⚠️ 已达最大轮次（{OPENCLAW_MAX_ROUNDS}），停止返工")
+                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 已达最大轮次（{OPENCLAW_MAX_ROUNDS}），停止返工")
                             return
 
                         task_desc = (
@@ -1198,7 +1203,8 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                             f"【原始任务】\n{relay_text}\n\n"
                             f"【你上一轮的结果被驳回，验收意见如下】\n{review[:2000]}\n\n"
                             f"请根据验收意见修改并重新提交结果。\n"
-                            f"提示：如果上一轮你独自完成但质量不够，考虑调用子 agent（如 agent-b-research）协助。"
+                            f"提示：如果上一轮你独自完成但质量不够，考虑调用子 agent（如 agent-b-research）协助。\n\n"
+                            f"[格式要求] 回复开头必须加标注：「[麦克斯 → Claude] 等待 Claude 验收」"
                         )
 
                 # ── 讨论模式：Claude 观点 → 麦克斯回应 → Claude 回应 → ... → Claude 总结 ──
@@ -1226,13 +1232,14 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                             f"请直接表达你的专业观点，不要客套。\n"
                             f"重要：如果需要数据支撑或专业视角，请调用子 agent（如 agent-b-research）协助。\n"
                             f"回复时请明确标注哪些观点来自你自己，哪些来自子 agent，格式如：\n"
-                            f"「我认为 X。另外，研究员补充了 Y 数据，支持/反驳了 Z 观点。」"
+                            f"「我认为 X。另外，研究员补充了 Y 数据，支持/反驳了 Z 观点。」\n\n"
+                            f"[格式要求] 回复开头必须加标注：「[麦克斯 → Claude] 等待 Claude 回应」"
                         )
                         print(f"[openclaw][讨论] {round_label} 麦克斯回应中...", flush=True)
 
                         oc_result = await _call_oc(agent_id, discuss_prompt)
                         if not oc_result or not oc_result[0].strip():
-                            await feishu.send_card_to_group(chat_id, f"⚠️ 麦克斯无回应（{round_label}），结束讨论")
+                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 麦克斯无回应（{round_label}），结束讨论")
                             break
                         oc_response, _, oc_model = oc_result
                         discussion_log.append(("麦克斯", oc_response))
@@ -1257,7 +1264,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         )
                         claude_response = await _call_claude(claude_prompt, effort="medium")
                         if not claude_response:
-                            await feishu.send_card_to_group(chat_id, f"⚠️ Claude 回应失败（{round_label}）")
+                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ Claude 回应失败（{round_label}）")
                             break
 
                         is_converged = claude_response.upper().startswith("CONVERGED")
@@ -1267,9 +1274,13 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
                         # 发送 Claude 的回应到群
                         model_line = f"📎 Claude: claude-sonnet-4-6 | 麦克斯: {oc_model or '未知'}"
+                        if is_converged:
+                            direction = "[Claude → 老大] 讨论已收敛，正在生成总结"
+                        else:
+                            direction = "[Claude → 麦克斯] 等待麦克斯回应"
                         await feishu.send_card_to_group(
                             chat_id,
-                            f"**💬 Claude 回应（{round_label}）**\n{model_line}\n\n{claude_clean[:2000]}"
+                            f"{direction}\n**💬 Claude 回应（{round_label}）**\n{model_line}\n\n{claude_clean[:2000]}"
                         )
                         print(f"[openclaw][讨论] {round_label} Claude 回应完成, converged={is_converged}", flush=True)
 
@@ -1292,11 +1303,12 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
                             await feishu.send_card_to_group(
                                 chat_id,
+                                f"[Claude → 老大] 等待老大定夺\n"
                                 f"**⏸ 讨论暂停（已 {OPENCLAW_MAX_ROUNDS} 轮未收敛）**\n"
                                 f"📎 模型: claude-sonnet-4-6\n\n"
                                 f"{status_text}\n\n"
                                 f"---\n"
-                                f"请定夺：\n"
+                                f"老大请定夺：\n"
                                 f"• 回复「继续讨论」→ 再进行 {OPENCLAW_MAX_ROUNDS} 轮\n"
                                 f"• 回复你的决定/方向 → Claude 据此出最终总结\n"
                                 f"• 不回复 → 讨论到此为止"
@@ -1326,6 +1338,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                     if summary:
                         await feishu.send_card_to_group(
                             chat_id,
+                            f"[Claude → 老大] 讨论完成，请老大过目\n"
                             f"**📋 讨论总结（{len(discussion_log)} 轮发言，自然收敛）**\n📎 模型: claude-sonnet-4-6\n\n{summary[:3000]}"
                         )
                     print(f"[openclaw][讨论] 总结完成，共 {len(discussion_log)} 轮发言", flush=True)
