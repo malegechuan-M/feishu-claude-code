@@ -28,6 +28,7 @@ from commands import parse_command, handle_command
 from claude_runner import run_claude
 from run_control import ActiveRun, ActiveRunRegistry, stop_run
 from memory_bridge import recall_all, capture_memory
+from llm_client import chat_haiku
 from prompt_guard import sanitize
 from quota_tracker import tracker as quota_tracker
 from group_memory import record_message as gm_record, get_group_context
@@ -1124,17 +1125,25 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                 # ── 模式判断 ──
 
                 async def _classify_mode():
-                    """让 Claude 判断是「工作」还是「讨论」模式"""
-                    prompt = (
-                        f"判断以下内容的意图，只回复一个词：TASK 或 DISCUSS\n\n"
-                        f"- TASK：派发工作、执行任务、查数据、做事情（有明确的交付物）\n"
-                        f"- DISCUSS：讨论、分析、辩论、探讨、评估、比较（需要多角度观点碰撞）\n\n"
-                        f"内容：{relay_text[:500]}\n\n"
-                        f"只回复 TASK 或 DISCUSS，不要解释。"
-                    )
-                    result = await _call_claude(prompt)
-                    if result and "DISCUSS" in result.upper():
-                        return "discuss"
+                    """用 Haiku API 轻量判断「工作」还是「讨论」模式（省 token）"""
+                    try:
+                        result = await chat_haiku(
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    f"判断意图，只回复 TASK 或 DISCUSS：\n"
+                                    f"- TASK：执行任务、查数据、做事情\n"
+                                    f"- DISCUSS：讨论、分析、辩论、评估\n\n"
+                                    f"{relay_text[:300]}"
+                                ),
+                            }],
+                            max_tokens=10,
+                            temperature=0.0,
+                        )
+                        if result and "DISCUSS" in result.upper():
+                            return "discuss"
+                    except Exception as e:
+                        print(f"[openclaw] Haiku 分类失败，默认 task: {e}", flush=True)
                     return "task"
 
                 # ── 工作模式：派发 → 验收 → 返工 ──
@@ -1248,9 +1257,11 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         claude_prompt = (
                             f"你正在与麦克斯（OpenClaw, 模型 {oc_model or 'MiniMax'})进行专业讨论。\n\n"
                             f"【讨论主题】\n{relay_text}\n\n"
-                            f"【之前的讨论记录】\n"
+                            f"【近期讨论记录（最近 2 轮）】\n"
                         )
-                        for speaker, content in discussion_log:
+                        # 只注入最近 4 条发言（2 轮对话），防止上下文膨胀
+                        recent_log = discussion_log[-4:] if len(discussion_log) > 4 else discussion_log
+                        for speaker, content in recent_log:
                             claude_prompt += f"--- {speaker} ---\n{content[:800]}\n\n"
                         claude_prompt += (
                             f"【麦克斯最新回应（{round_label}）】\n{oc_response[:2000]}\n\n"
@@ -1327,7 +1338,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         f"【完整讨论记录】\n"
                     )
                     for speaker, content in discussion_log:
-                        summary_prompt += f"--- {speaker} ---\n{content[:600]}\n\n"
+                        summary_prompt += f"--- {speaker} ---\n{content[:400]}\n\n"
                     summary_prompt += (
                         f"请输出：\n"
                         f"1. **共识**：双方达成一致的要点\n"
