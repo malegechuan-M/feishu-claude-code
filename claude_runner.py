@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
 
-IDLE_TIMEOUT = 300  # 5 分钟无任何输出视为挂死
+IDLE_TIMEOUT = 900  # 15 分钟无任何输出视为挂死（工具执行/深度思考可能很久）
 
 
 def _extract_text_content(value) -> str:
@@ -41,6 +41,7 @@ async def run_claude(
     model: Optional[str] = None,
     cwd: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    effort: Optional[str] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
     on_tool_use: Optional[Callable[[str, dict], None]] = None,
     on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
@@ -65,6 +66,13 @@ async def run_claude(
             cmd += ["--resume", active_session_id]
         if model:
             cmd += ["--model", model]
+        if effort and effort in ("low", "medium", "high", "max"):
+            cmd += ["--effort", effort]
+        # 禁用 Telegram 插件（飞书 Bot 不需要）
+        cmd += ["--disallowed-tools", "mcp__plugin_telegram_telegram__reply",
+                "mcp__plugin_telegram_telegram__edit_message",
+                "mcp__plugin_telegram_telegram__react",
+                "mcp__plugin_telegram_telegram__download_attachment"]
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
@@ -186,6 +194,19 @@ async def run_claude(
         detail = stderr_text or "no stderr"
         if final_text:
             detail += f" (partial output length={len(final_text)})"
+        # 检测限流错误，通知 QuotaTracker 学习阈值并设置冷却
+        if stderr_text and (
+            "rate limit" in stderr_text.lower()
+            or "too many requests" in stderr_text.lower()
+            or "429" in stderr_text
+        ):
+            try:
+                from quota_tracker import tracker as quota_tracker
+                if model:
+                    quota_tracker.on_rate_limit(model)
+                    print(f"[quota] 检测到限流，已通知 QuotaTracker: model={model}", flush=True)
+            except Exception as _qe:
+                print(f"[quota] on_rate_limit 失败（忽略）: {_qe}", flush=True)
         # 如果有部分输出，返回给用户看而不是抛异常
         if final_text:
             return final_text, new_session_id, used_fresh_session_fallback

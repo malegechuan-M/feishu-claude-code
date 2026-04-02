@@ -13,7 +13,13 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 from bot_config import CLAUDE_CLI, DEFAULT_CWD
-from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title
+from session_store import (
+    SessionStore,
+    scan_cli_sessions,
+    generate_summary,
+    _get_api_token,
+    _write_custom_title,
+)
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
 
@@ -51,7 +57,10 @@ HELP_TEXT = """\
 `/status` — 显示当前 session 信息
 `/cd [路径]` — 切换工具执行的工作目录
 `/ls [路径]` — 查看当前工作目录下的文件/目录
-`/workspace` 或 `/ws` — 保存/切换群组工作空间
+ `/workspace` 或 `/ws` — 保存/切换群组工作空间
+ `/reindex` — 触发知识库增量索引 / `reindex force` 全量重建
+ `/tasks` — 查看进行中的长任务列表
+ `/resume-task [任务ID]` — 恢复指定的长任务继续执行
 
 **查看能力：**
 `/skills` — 列出已安装的 Claude Skills
@@ -85,12 +94,40 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
-    "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
-    "workspace", "ws", "skills", "mcp", "usage", "stop", "schedule",
+    "help",
+    "h",
+    "new",
+    "clear",
+    "resume",
+    "model",
+    "mode",
+    "status",
+    "cd",
+    "ls",
+    "workspace",
+    "ws",
+    "skills",
+    "mcp",
+    "usage",
+    "stop",
+    "schedule",
+    "reindex",
+    "tasks",
+    "resume-task",
+    "quota",
+    "contact",
+    "group-memory",
+    "instinct",
+    "review",
+    "install",
+    "skill-create",
+    "skills",
 }
 
 
-async def _build_session_list(user_id: str, chat_id: str, store: SessionStore) -> list[dict]:
+async def _build_session_list(
+    user_id: str, chat_id: str, store: SessionStore
+) -> list[dict]:
     """构建合并、去重、排序后的 session 列表（不含当前 session）。
     /resume 列表展示和 /resume N 选择都用这一个函数，保证索引一致。"""
     cur_sid = (await store.get_current_raw(user_id, chat_id)).get("session_id")
@@ -108,7 +145,8 @@ async def _build_session_list(user_id: str, chat_id: str, store: SessionStore) -
 
     feishu_ids = {s["session_id"] for s in feishu_sessions}
     cli_sessions = [
-        s for s in cli_all
+        s
+        for s in cli_all
         if s["session_id"] not in feishu_ids and len(s.get("preview", "")) > 5
     ]
     all_sessions = feishu_sessions + cli_sessions
@@ -207,8 +245,11 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) 
     # 当前 session
     if cur_sid:
         cli_info = cli_preview_map.get(cur_sid)
-        preview = (cli_info.get("preview") if cli_info and cli_info.get("preview")
-                   else cur.get("preview") or "")
+        preview = (
+            cli_info.get("preview")
+            if cli_info and cli_info.get("preview")
+            else cur.get("preview") or ""
+        )
         started = _fmt_time(cur.get("started_at", ""))
         lines.append(f"当前  {_desc(cur_sid, preview)} ({started})  #{cur_sid[:8]}")
 
@@ -253,7 +294,7 @@ def _list_skills() -> str:
                         if line == "---" and in_frontmatter:
                             break
                         if in_frontmatter and line.startswith("description:"):
-                            desc = line[len("description:"):].strip().strip('"')
+                            desc = line[len("description:") :].strip().strip('"')
             except OSError:
                 pass
             skills.append((name, desc))
@@ -282,19 +323,29 @@ def _get_usage() -> str:
 
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         creds = json.loads(result.stdout.strip())
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
         return f"❌ 读取凭证失败：{e}"
 
-    body = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
+    body = json.dumps(
+        {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).encode()
 
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -318,7 +369,11 @@ def _get_usage() -> str:
         return f"❌ 获取用量失败：{e}"
 
     def h(key):
-        return headers.get(key) or headers.get(key.lower()) or headers.get(key.replace("-", "_"))
+        return (
+            headers.get(key)
+            or headers.get(key.lower())
+            or headers.get(key.replace("-", "_"))
+        )
 
     def fmt_pct(val):
         if val is None:
@@ -363,13 +418,14 @@ def _get_usage() -> str:
     return "\n".join(lines)
 
 
-
 def _list_mcp() -> str:
     """调用 claude mcp list 获取已配置的 MCP servers"""
     try:
         result = subprocess.run(
             [CLAUDE_CLI, "mcp", "list"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         output = result.stdout.strip()
     except Exception as e:
@@ -381,7 +437,9 @@ def _list_mcp() -> str:
     return f"🔌 **已配置的 MCP Servers**\n\n{output}"
 
 
-async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args: str) -> str:
+async def _list_directory(
+    user_id: str, chat_id: str, store: SessionStore, args: str
+) -> str:
     cur = await store.get_current_raw(user_id, chat_id)
     base_dir = cur.get("cwd", DEFAULT_CWD)
     raw_target = args.strip()
@@ -407,7 +465,9 @@ async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args:
         with os.scandir(target) as it:
             for entry in it:
                 suffix = "/" if entry.is_dir() else ""
-                entries.append((not entry.is_dir(), entry.name.lower(), f"`{entry.name}{suffix}`"))
+                entries.append(
+                    (not entry.is_dir(), entry.name.lower(), f"`{entry.name}{suffix}`")
+                )
     except OSError as e:
         return f"❌ 读取目录失败：{e}"
 
@@ -432,14 +492,18 @@ async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args:
     return "\n".join(lines)
 
 
-async def _format_workspace_list(user_id: str, chat_id: str, store: SessionStore) -> str:
+async def _format_workspace_list(
+    user_id: str, chat_id: str, store: SessionStore
+) -> str:
     cur = await store.get_current_raw(user_id, chat_id)
     current_name = cur.get("workspace", "")
     current_cwd = cur.get("cwd", "~")
     workspaces = store.list_workspaces(user_id)
 
     lines = ["🗂 **工作空间**"]
-    lines.append(f"当前绑定：`{current_name}`" if current_name else "当前绑定：（未命名）")
+    lines.append(
+        f"当前绑定：`{current_name}`" if current_name else "当前绑定：（未命名）"
+    )
     lines.append(f"当前目录：`{current_cwd}`")
 
     if workspaces:
@@ -527,10 +591,7 @@ async def _handle_workspace_command(
             return f"❌ 未找到工作空间：`{name}`"
         return f"✅ 已删除工作空间 `{name}`"
 
-    return (
-        f"❌ 未知子命令：`{action}`\n"
-        "可用：`list`、`save`、`use`、`set`、`remove`"
-    )
+    return f"❌ 未知子命令：`{action}`\n可用：`list`、`save`、`use`、`set`、`remove`"
 
 
 async def handle_command(
@@ -608,7 +669,9 @@ async def handle_command(
         if not args:
             cur = await store.get_current(user_id, chat_id)
             current_mode = cur.permission_mode
-            lines = [f"当前模式：**{current_mode}** — {VALID_MODES.get(current_mode, '')}\n"]
+            lines = [
+                f"当前模式：**{current_mode}** — {VALID_MODES.get(current_mode, '')}\n"
+            ]
             lines.append("**可选模式：**")
             for mode, desc in VALID_MODES.items():
                 marker = " ← 当前" if mode == current_mode else ""
@@ -652,6 +715,7 @@ async def handle_command(
 
     elif cmd == "schedule":
         from scheduler import add_schedule, remove_schedule, list_schedules
+
         if not args:
             tasks = list_schedules(chat_id)
             if not tasks:
@@ -681,6 +745,7 @@ async def handle_command(
 
         # 解析 cron 表达式（支持 HH:MM、every Xm、标准 5 字段 cron）
         import re
+
         # every Xm 格式
         m = re.match(r"(every\s+\d+m)\s+(.*)", args, re.DOTALL)
         if m:
@@ -710,7 +775,13 @@ async def handle_command(
         )
 
     elif cmd == "memory":
-        from memory_local import read_recent_logs, read_pending_candidates, MEMORY_FILE, SOUL_FILE
+        from memory_local import (
+            read_recent_logs,
+            read_pending_candidates,
+            MEMORY_FILE,
+            SOUL_FILE,
+        )
+
         if args == "soul":
             try:
                 return f"**SOUL.md**\n\n{SOUL_FILE.read_text(encoding='utf-8')}"
@@ -737,13 +808,223 @@ async def handle_command(
     elif cmd == "promote":
         if not args:
             from memory_local import read_pending_candidates
+
             candidates = read_pending_candidates()
             if not candidates:
                 return "📭 当前没有待晋升的记忆候选。"
             return f"**待晋升候选**（用 `/promote 规则内容` 确认写入）\n\n{candidates[:1500]}"
         from memory_local import promote_to_memory
+
         ok = promote_to_memory(args)
         return f"✅ 已写入 MEMORY.md：{args}" if ok else "❌ 写入失败"
+
+    elif cmd == "reindex":
+        from indexer import build_index
+        import threading
+
+        force = args.strip() == "force"
+
+        def _do():
+            try:
+                count = build_index(force=force)
+                print(f"[reindex] 完成，处理了 {count} 块", flush=True)
+            except Exception as e:
+                print(f"[reindex] 失败: {e}", flush=True)
+
+        threading.Thread(target=_do, daemon=True).start()
+        action = "全量重建" if force else "增量索引"
+        return f"✅ 已在后台启动 {action}，完成时会输出日志。"
+
+    elif cmd == "tasks":
+        from long_task import list_active_tasks, get_task, get_latest_checkpoint
+
+        rows = list_active_tasks(chat_id)
+        if not rows:
+            return (
+                "📋 **进行中的长任务**\n\n暂无进行中的任务。\n"
+                "发送任务类消息（如「帮我做个报告」「分析一下XX」）会 "
+                "自动创建任务并保存检查点，崩溃可恢复。"
+            )
+        lines = ["📋 **进行中的长任务**\n"]
+        for i, row in enumerate(rows, 1):
+            latest = row["latest_step_desc"]
+            latest_str = f"\n  ↳ 当前：{latest[:50]}" if latest else ""
+            lines.append(
+                f"{i}. `{row['id']}` | {row['checkpoint_count']} 个检查点 | "
+                f"{row['description'][:40]}{latest_str}"
+            )
+        lines.append("\n回复 `/resume-task 任务ID` 继续任务")
+        lines.append("回复 `/resume-task del 任务ID` 删除任务")
+        return "\n".join(lines)
+
+    elif cmd == "resume-task":
+        from long_task import get_task, get_latest_checkpoint, get_checkpoints
+
+        if not args:
+            return "⚠️ 用法：`/resume-task 任务ID`\n先 `/tasks` 查看任务 ID 列表。"
+
+        parts = args.split(None, 1)
+        task_id_or_del = parts[0].strip()
+
+        if task_id_or_del.lower() == "del":
+            if len(parts) < 2:
+                return "⚠️ 用法：`/resume-task del 任务ID`"
+            from long_task import abandon_task
+
+            ok = abandon_task(parts[1].strip())
+            return "✅ 已删除" if ok else "❌ 未找到该任务 ID"
+        if not args.strip():
+            return "⚠️ 用法：`/resume-task 任务ID`"
+
+        task = get_task(task_id_or_del)
+        if not task:
+            return f"❌ 未找到任务：`{task_id_or_del}`"
+        if task["status"] != "active":
+            return f"⚠️ 该任务状态为 `{task['status']}`，无法恢复。"
+
+        checkpoints = get_checkpoints(task_id_or_del)
+        cp_count = len(checkpoints)
+        latest = get_latest_checkpoint(task_id_or_del)
+        latest_step = latest["step"] if latest else 0
+        latest_desc = latest["step_desc"] if latest else ""
+
+        await store.set_pending_resume_task(user_id, chat_id, task_id_or_del)
+
+        info = (
+            f"✅ **任务已找到**（ID: `{task['id']}`）\n"
+            f"描述：{task['description'][:80]}\n"
+            f"检查点：共 {cp_count} 个，上次停在步骤 {latest_step}\n"
+        )
+        if latest_desc:
+            info += f"上一步：{latest_desc[:60]}\n"
+        info += "\n已注入检查点历史到上下文，继续对话即可延续任务。\n如需放弃：`/resume-task del {task_id_or_del}`"
+        return info
+
+    elif cmd == "quota":
+        # 查看各模型配额状态和降级情况
+        try:
+            from quota_tracker import tracker as quota_tracker
+            return quota_tracker.get_status()
+        except Exception as e:
+            return f"❌ 获取配额状态失败: {e}"
+
+    elif cmd == "group-memory":
+        # chat_id 以 oc_ 开头为群聊，ou_ 开头为私聊
+        if not chat_id.startswith("oc_"):
+            return "此命令仅在群聊中可用"
+        from group_memory import get_group_status
+        return get_group_status(chat_id)
+
+    elif cmd == "contact":
+        from contact_memory import get_contact
+        if args:
+            # 查看指定用户
+            data = get_contact(args.strip())
+        else:
+            # 查看发送者自己
+            data = get_contact(user_id)
+
+        if not data or data.get("message_count", 0) == 0:
+            return "暂无该联系人的记录"
+
+        lines = [f"**👤 联系人档案**\n"]
+        lines.append(f"**姓名**: {data.get('name') or '未知'}")
+        lines.append(f"**首次交互**: {data.get('first_seen', '未知')[:10]}")
+        lines.append(f"**最近交互**: {data.get('last_seen', '未知')[:10]}")
+        lines.append(f"**消息总数**: {data.get('message_count', 0)}")
+
+        if data.get("traits"):
+            lines.append(f"\n**特征**: {', '.join(data['traits'][-10:])}")
+        if data.get("topics"):
+            lines.append(f"**常聊话题**: {', '.join(data['topics'][-10:])}")
+        if data.get("preferences"):
+            for k, v in data["preferences"].items():
+                lines.append(f"**偏好 {k}**: {v}")
+        if data.get("notes"):
+            lines.append(f"\n**最近备注**: {data['notes'][-1]}")
+        if data.get("patterns"):
+            lines.append(f"**行为模式**: {', '.join(data['patterns'][-5:])}")
+
+        return "\n".join(lines)
+
+    elif cmd == "instinct":
+        from instinct_manager import (
+            get_instinct_list, activate, reject as reject_instinct,
+            create_instinct, deactivate,
+        )
+        if not args:
+            return get_instinct_list()
+
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower()
+        subarg = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            return get_instinct_list()
+        elif subcmd == "approve" and subarg:
+            ok = activate(subarg.strip())
+            return f"✅ 直觉 `{subarg}` 已激活" if ok else f"❌ 未找到 `{subarg}`"
+        elif subcmd == "reject" and subarg:
+            ok = reject_instinct(subarg.strip())
+            return f"✅ 直觉 `{subarg}` 已拒绝删除" if ok else f"❌ 未找到 `{subarg}`"
+        elif subcmd == "deactivate" and subarg:
+            ok = deactivate(subarg.strip())
+            return f"✅ 直觉 `{subarg}` 已停用" if ok else f"❌ 未找到 `{subarg}`"
+        elif subcmd == "create" and "|" in subarg:
+            trigger, action = subarg.split("|", 1)
+            iid = create_instinct(trigger.strip(), action.strip(), source="manual", status="active")
+            return f"✅ 已创建直觉 `{iid}`: 当「{trigger.strip()}」→ {action.strip()}"
+        elif subcmd == "evolve":
+            from instinct_manager import evolve_instincts
+            return evolve_instincts()
+        else:
+            return ("用法:\n"
+                    "  `/instinct` — 查看所有\n"
+                    "  `/instinct approve <id>` — 审批通过\n"
+                    "  `/instinct reject <id>` — 拒绝删除\n"
+                    "  `/instinct deactivate <id>` — 停用\n"
+                    "  `/instinct create <触发词> | <期望行为>` — 创建新直觉\n"
+                    "  `/instinct evolve` — 将相似直觉聚类为技能 SOP")
+
+    elif cmd == "review":
+        if not args:
+            return ("用法: `/review <文本>` — 审查指定内容\n"
+                    "也可在群聊中回复其他 Bot 的消息并输入 `/review`")
+        from review_mode import review_output, format_review
+        review = review_output(args, source="manual")
+        return format_review(review, source="手动审查")
+
+    elif cmd == "install":
+        from capability_installer import list_proposals, execute_install, reject_install, propose_install
+        if not args:
+            return list_proposals()
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower()
+        subarg = parts[1] if len(parts) > 1 else ""
+        if subcmd == "list":
+            return list_proposals(status=subarg if subarg else None)
+        elif subcmd == "approve" and subarg:
+            return execute_install(subarg.strip())
+        elif subcmd == "reject" and subarg:
+            return reject_install(subarg.strip())
+        elif subcmd == "propose" and "|" in subarg:
+            action, target = subarg.split("|", 1)
+            return json.dumps(propose_install(action.strip(), target.strip()), ensure_ascii=False)
+        else:
+            return ("用法:\n"
+                    "  `/install` — 查看提案列表\n"
+                    "  `/install approve <id>` — 批准执行\n"
+                    "  `/install reject <id>` — 拒绝\n"
+                    "  `/install propose <action> | <target>` — 提交提案")
+
+    elif cmd == "skill-create":
+        from skill_creator import create_skill_from_git
+        repo = args.strip() if args else os.path.expanduser("~/feishu-claude-code")
+        return create_skill_from_git(repo_path=repo)
+
+    elif cmd == "skills":
+        from skill_creator import list_skills
+        return list_skills()
 
     else:
         return None  # fallback: 转发给 Claude

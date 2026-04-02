@@ -26,6 +26,7 @@ def _get_mem0():
     if _mem0_client is None:
         try:
             from mem0 import MemoryClient
+
             _mem0_client = MemoryClient(api_key=MEM0_API_KEY)
             print("[memory_bridge] mem0 客户端初始化成功", flush=True)
         except Exception as e:
@@ -39,8 +40,13 @@ def _get_mem0():
 # Claude Bot 使用自己的命名空间，同时搜索时也查 OpenClaw 的
 MEM0_CLAUDE_USER_ID = f"{MEM0_USER_ID}:agent:claude-feishu"
 MEM0_OPENCLAW_AGENTS = [
-    "agent-a-coo",       # 总控官（主要记忆来源）
-    "agent-b-research",  # 市场研究员
+    "agent-a-coo",         # 总控官（主要记忆来源）
+    "agent-b-research",    # 市场研究员
+    "agent-c-trading",     # 交易/电商
+    "agent-d-intern",      # 实习生/执行
+    "agent-e-workflow",    # 工作流
+    "agent-f-legal",       # 法务
+    "agent-asii",          # ASII Agent
     "xiaohongshu-expert",  # 小红书专家
 ]
 
@@ -61,7 +67,9 @@ def recall_memories(query: str, limit: int = 5) -> str:
             items = results.get("results", []) if isinstance(results, dict) else results
             for item in items:
                 text = item.get("memory", "") if isinstance(item, dict) else str(item)
-                if text and text not in [m.split("] ", 1)[-1] if "] " in m else m for m in memories]:
+                if text and text not in [
+                    m.split("] ", 1)[-1] if "] " in m else m for m in memories
+                ]:
                     source = uid.split(":")[-1] if ":" in uid else uid
                     memories.append(f"  - [{source}] {text}")
         except Exception as e:
@@ -85,6 +93,7 @@ def capture_memory(user_message: str, assistant_response: str) -> None:
 
 
 # ── OpenClaw FTS5 本地搜索 ────────────────────────────────────
+
 
 def search_openclaw_fts(
     query: str,
@@ -143,7 +152,10 @@ def search_openclaw_workspace_memory(query: str, limit: int = 3) -> str:
                 if any(kw in content.lower() for kw in keywords):
                     # 提取包含关键词的段落
                     for line in content.split("\n"):
-                        if any(kw in line.lower() for kw in keywords) and len(line.strip()) > 10:
+                        if (
+                            any(kw in line.lower() for kw in keywords)
+                            and len(line.strip()) > 10
+                        ):
                             matches.append(f"  [{f.name}] {line.strip()[:200]}")
                             if len(matches) >= limit:
                                 break
@@ -159,9 +171,11 @@ def search_openclaw_workspace_memory(query: str, limit: int = 3) -> str:
 
 # ── 统一搜索入口 ──────────────────────────────────────────────
 
+
 def search_claude_local_memory(query: str, limit: int = 3) -> str:
     """搜索 Claude 本地记忆：近期日志摘要 + ERRORS.md 关键词匹配。"""
     from pathlib import Path
+
     memory_dir = Path.home() / ".feishu-claude" / "memory"
     learnings_dir = Path.home() / ".feishu-claude" / "learnings"
 
@@ -174,7 +188,10 @@ def search_claude_local_memory(query: str, limit: int = 3) -> str:
         for f in summaries:
             content = f.read_text(encoding="utf-8", errors="replace")
             for line in content.split("\n"):
-                if any(kw in line.lower() for kw in keywords) and len(line.strip()) > 10:
+                if (
+                    any(kw in line.lower() for kw in keywords)
+                    and len(line.strip()) > 10
+                ):
                     matches.append(f"  [{f.stem}] {line.strip()[:200]}")
                     if len(matches) >= limit:
                         break
@@ -185,7 +202,9 @@ def search_claude_local_memory(query: str, limit: int = 3) -> str:
 
     # 搜索 ERRORS.md
     try:
-        errors_content = (learnings_dir / "ERRORS.md").read_text(encoding="utf-8", errors="replace")
+        errors_content = (learnings_dir / "ERRORS.md").read_text(
+            encoding="utf-8", errors="replace"
+        )
         for line in errors_content.split("\n"):
             if any(kw in line.lower() for kw in keywords) and len(line.strip()) > 10:
                 matches.append(f"  [ERRORS] {line.strip()[:200]}")
@@ -199,10 +218,27 @@ def search_claude_local_memory(query: str, limit: int = 3) -> str:
 
 def recall_all(query: str) -> str:
     """
-    统一搜索：Claude 本地记忆 + mem0 云记忆 + OpenClaw FTS5 + workspace 文件。
+    统一搜索：向量知识库 + Claude 本地记忆 + mem0 云记忆 + OpenClaw FTS5。
     返回组合后的上下文文本，可直接注入到 Claude 提示词中。
     """
     sections = []
+
+    # 0. 向量知识库（优先级最高，语义搜索）
+    try:
+        from vector_store import VectorStore
+
+        vs = VectorStore()
+        if vs.count() > 0:
+            results = vs.query_similar(query, top_k=3)
+            if results:
+                parts = []
+                for r in results:
+                    if r["distance"] < 0.6:
+                        parts.append(f"  [{r['title']}] {r['summary'][:200]}")
+                if parts:
+                    sections.append("[向量知识库]\n" + "\n".join(parts))
+    except Exception as e:
+        print(f"[memory_bridge] 向量搜索失败: {e}", flush=True)
 
     # 1. Claude 本地记忆（日志摘要 + 错误教训）
     local_result = search_claude_local_memory(query)
@@ -214,10 +250,15 @@ def recall_all(query: str) -> str:
     if mem0_result:
         sections.append(f"[共享记忆 - mem0]\n{mem0_result}")
 
-    # 3. OpenClaw 总控官知识库
-    fts_result = search_openclaw_fts(query, agent_id="agent-a-coo")
-    if fts_result:
-        sections.append(f"[OpenClaw 知识库]\n{fts_result}")
+    # 3. OpenClaw 知识库（搜索所有 Agent 的 FTS5 索引）
+    fts_agents = ["agent-a-coo", "agent-b-research", "agent-c-trading", "agent-d-intern", "main"]
+    fts_parts = []
+    for agent_id in fts_agents:
+        result = search_openclaw_fts(query, agent_id=agent_id, limit=3)
+        if result:
+            fts_parts.append(result)
+    if fts_parts:
+        sections.append(f"[OpenClaw 知识库]\n" + "\n".join(fts_parts))
 
     # 4. OpenClaw workspace 近期记忆
     ws_result = search_openclaw_workspace_memory(query)

@@ -431,6 +431,110 @@ class FeishuClient:
             f"{history_text}\n---\n"
         )
 
+    async def fetch_missed_mentions(
+        self,
+        chat_id: str,
+        since_ts: float,
+        bot_open_id: str,
+        limit: int = 20,
+    ) -> list[dict]:
+        """
+        拉取 since_ts 之后群聊中 @bot 的消息，返回 [{message_id, sender_id, content, create_time}]。
+        用于重启后补偿漏掉的消息。
+        """
+        import ssl, urllib.request, urllib.parse
+
+        ctx = ssl.create_default_context()
+        token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
+        token_req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=token_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        loop = asyncio.get_event_loop()
+
+        def _http(req):
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                return json.loads(r.read())
+
+        token_data = await loop.run_in_executor(None, _http, token_req)
+        token = token_data.get("tenant_access_token", "")
+        if not token:
+            return []
+
+        # 飞书消息列表 API，按时间倒序
+        params = urllib.parse.urlencode({
+            "container_id_type": "chat",
+            "container_id": chat_id,
+            "sort_type": "ByCreateTimeDesc",
+            "page_size": min(limit * 2, 50),
+        })
+        msg_req = urllib.request.Request(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?{params}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        msg_data = await loop.run_in_executor(None, _http, msg_req)
+        items = msg_data.get("data", {}).get("items", [])
+        if not items:
+            return []
+
+        missed = []
+        for item in items:
+            # create_time 是毫秒字符串
+            create_time_ms = int(item.get("create_time", "0"))
+            create_time_s = create_time_ms / 1000.0
+            if create_time_s <= since_ts:
+                break  # 已到达上次处理的时间点
+
+            # 检查是否 @了 bot
+            mentions = item.get("mentions", [])
+            mentioned_bot = any(
+                m.get("id", {}).get("open_id") == bot_open_id
+                for m in mentions
+            ) if mentions else False
+
+            if not mentioned_bot:
+                continue
+
+            # 提取文本内容
+            msg_type = item.get("msg_type", "")
+            raw_content = item.get("body", {}).get("content", "")
+            text_content = ""
+            if msg_type == "text":
+                try:
+                    text_content = json.loads(raw_content).get("text", "").strip()
+                except Exception:
+                    text_content = raw_content.strip()
+            elif msg_type == "post":
+                try:
+                    post = json.loads(raw_content)
+                    parts = []
+                    for block in post.get("zh_cn", {}).get("content", []):
+                        for el in block:
+                            t = el.get("text") or el.get("content", "")
+                            if t:
+                                parts.append(t)
+                    text_content = "\n".join(parts).strip()
+                except Exception:
+                    text_content = raw_content.strip()
+
+            if not text_content:
+                continue
+
+            missed.append({
+                "message_id": item.get("message_id", ""),
+                "sender_id": item.get("sender", {}).get("id", ""),
+                "content": text_content,
+                "create_time": create_time_s,
+                "msg_type": msg_type,
+                "mentions": mentions,
+            })
+
+        # 按时间正序返回（最早的在前）
+        missed.reverse()
+        return missed[:limit]
+
     async def send_at_message_to_group(self, chat_id: str, text: str, at_open_id: str, at_name: str) -> str:
         """向群聊发送带 @mention 的文本消息（真正的 @，会触发对方的消息事件）"""
         # 飞书文本消息中 @mention 的格式

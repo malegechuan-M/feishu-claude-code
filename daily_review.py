@@ -44,6 +44,14 @@ def run_claude_summary(prompt: str) -> str:
 
 
 def run_daily_review():
+    # 七步进化（新增）
+    try:
+        from daily_evolution import run_evolution
+        evolution_report = run_evolution()
+        print(f"[daily] 进化完成:\n{evolution_report[:500]}", flush=True)
+    except Exception as e:
+        print(f"[daily] 进化失败（继续执行原有复盘）: {e}", flush=True)
+
     log_path = _daily_log_path()
     summary_path = _summary_path()
 
@@ -134,6 +142,13 @@ def run_daily_review():
                 write_promotion_candidate(c, source=f"每日复盘 {_today()}")
 
     print(f"[daily_review] 完成", flush=True)
+
+    # ── 记忆文件压缩检查 ─────────────────────────────────────
+    try:
+        from memory_compressor import check_and_compress
+        check_and_compress()
+    except Exception as _mc_err:
+        print(f"[daily_review] memory_compressor 调用失败（忽略）: {_mc_err}", flush=True)
 
 
 if __name__ == "__main__":

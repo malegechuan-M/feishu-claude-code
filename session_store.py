@@ -48,16 +48,24 @@ def scan_cli_sessions(limit: int = 30) -> list[dict]:
 
 import re
 
+
 def _clean_preview(text: str) -> str:
     """清洗 preview 文本，去掉系统注入内容"""
     # 去掉 [环境：...] 前缀
-    text = re.sub(r'^\[环境：[^\]]*\]\s*', '', text)
+    text = re.sub(r"^\[环境：[^\]]*\]\s*", "", text)
     # 去掉 <local-command-caveat>...</local-command-caveat> 及其后的系统文本
-    text = re.sub(r'<local-command-caveat>.*?</local-command-caveat>\s*', '', text, flags=re.DOTALL)
+    text = re.sub(
+        r"<local-command-caveat>.*?</local-command-caveat>\s*",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
     # 去掉 <system-reminder>...</system-reminder>
-    text = re.sub(r'<system-reminder>.*?</system-reminder>\s*', '', text, flags=re.DOTALL)
+    text = re.sub(
+        r"<system-reminder>.*?</system-reminder>\s*", "", text, flags=re.DOTALL
+    )
     # 去掉其他 XML-like 系统标签
-    text = re.sub(r'<[a-z_-]+>.*?</[a-z_-]+>\s*', '', text, flags=re.DOTALL)
+    text = re.sub(r"<[a-z_-]+>.*?</[a-z_-]+>\s*", "", text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -110,6 +118,7 @@ def _parse_session_file(fpath: str, session_id: str, mtime: float) -> dict:
         "source": "terminal",
     }
 
+
 def _find_session_file(session_id: str) -> Optional[str]:
     """在 ~/.claude/projects/ 下找到 session 对应的 .jsonl 文件"""
     if not os.path.isdir(CLAUDE_PROJECTS_DIR):
@@ -146,8 +155,7 @@ def _extract_conversation_context(fpath: str, max_chars: int = 2000) -> str:
                 content = msg.get("content", "")
                 if isinstance(content, list):
                     text = " ".join(
-                        b.get("text", "") for b in content
-                        if b.get("type") == "text"
+                        b.get("text", "") for b in content if b.get("type") == "text"
                     ).strip()
                 else:
                     text = str(content).strip()
@@ -176,8 +184,16 @@ def _get_api_token() -> Optional[str]:
                 creds = json.load(f)
             return creds["claudeAiOauth"]["accessToken"]
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         creds = json.loads(result.stdout.strip())
         return creds["claudeAiOauth"]["accessToken"]
@@ -198,15 +214,21 @@ def generate_summary(session_id: str, token: Optional[str] = None) -> str:
     if not token:
         return ""
 
-    body = json.dumps({
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 80,
-        "messages": [{"role": "user", "content": (
-            "请用一句话（15-25个字）总结以下对话的主题。"
-            "只返回摘要文本，不要加引号或其他格式。\n\n"
-            + context[:2000]
-        )}],
-    }).encode()
+    body = json.dumps(
+        {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 80,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "请用一句话（15-25个字）总结以下对话的主题。"
+                        "只返回摘要文本，不要加引号或其他格式。\n\n" + context[:2000]
+                    ),
+                }
+            ],
+        }
+    ).encode()
 
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -253,11 +275,14 @@ def _write_custom_title(session_id: str, title: str):
     except OSError:
         return
     # 追加 custom-title 行
-    entry = json.dumps({
-        "type": "custom-title",
-        "customTitle": title,
-        "sessionId": session_id,
-    }, ensure_ascii=False)
+    entry = json.dumps(
+        {
+            "type": "custom-title",
+            "customTitle": title,
+            "sessionId": session_id,
+        },
+        ensure_ascii=False,
+    )
     try:
         with open(fpath, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
@@ -276,12 +301,16 @@ class Session:
         cwd: str,
         permission_mode: str,
         workspace: str = "",
+        context_injected: bool = False,
+        pending_resume_task_id: str = "",
     ):
         self.session_id = session_id
         self.model = model
         self.cwd = cwd
         self.permission_mode = permission_mode
         self.workspace = workspace
+        self.context_injected = context_injected
+        self.pending_resume_task_id = pending_resume_task_id
 
 
 class SessionStore:
@@ -347,6 +376,7 @@ class SessionStore:
             "started_at": datetime.now().isoformat(),
             "preview": "",
             "workspace": "",
+            "pending_resume_task_id": "",
         }
 
     def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
@@ -381,7 +411,9 @@ class SessionStore:
             changed = True
 
         chat_data = user[chat_key]
-        if self._ensure_current_defaults(chat_data.setdefault("current", self._default_current())):
+        if self._ensure_current_defaults(
+            chat_data.setdefault("current", self._default_current())
+        ):
             changed = True
         if "history" not in chat_data:
             chat_data["history"] = []
@@ -411,9 +443,31 @@ class SessionStore:
             cwd=cur.get("cwd", DEFAULT_CWD),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
+            context_injected=cur.get("context_injected", False),
+            pending_resume_task_id=cur.get("pending_resume_task_id", ""),
         )
 
-    async def on_claude_response(self, user_id: str, chat_id: str, new_session_id: str, first_message: str):
+    async def mark_context_injected(self, user_id: str, chat_id: str):
+        """标记 brain/memory 上下文已注入到当前 session，后续轮次跳过"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["context_injected"] = True
+        await self._save_async()
+
+    async def set_pending_resume_task(self, user_id: str, chat_id: str, task_id: str):
+        """设置待恢复的任务 ID，下次消息处理时注入检查点上下文"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["pending_resume_task_id"] = task_id
+        await self._save_async()
+
+    async def clear_pending_resume_task(self, user_id: str, chat_id: str):
+        """清除待恢复的任务 ID"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["pending_resume_task_id"] = ""
+        await self._save_async()
+
+    async def on_claude_response(
+        self, user_id: str, chat_id: str, new_session_id: str, first_message: str
+    ):
         """Claude 回复后用返回的 session_id 更新状态"""
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
@@ -421,12 +475,16 @@ class SessionStore:
 
         if old_id and old_id != new_session_id:
             # 归档旧 session（先去重，避免同一 session_id 重复出现）
-            chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
-            chat_data["history"].append({
-                "session_id": old_id,
-                "started_at": cur.get("started_at", ""),
-                "preview": cur.get("preview", ""),
-            })
+            chat_data["history"] = [
+                h for h in chat_data["history"] if h["session_id"] != old_id
+            ]
+            chat_data["history"].append(
+                {
+                    "session_id": old_id,
+                    "started_at": cur.get("started_at", ""),
+                    "preview": cur.get("preview", ""),
+                }
+            )
             chat_data["history"] = chat_data["history"][-20:]
             cur["started_at"] = datetime.now().isoformat()
             # 为归档的 session 生成摘要（best-effort）
@@ -435,7 +493,9 @@ class SessionStore:
                 try:
                     summary = generate_summary(old_id)
                     if summary:
-                        self._data[user_id].setdefault("summaries", {})[old_id] = summary
+                        self._data[user_id].setdefault("summaries", {})[old_id] = (
+                            summary
+                        )
                         _write_custom_title(old_id, summary)
                 except Exception:
                     pass
@@ -454,12 +514,16 @@ class SessionStore:
         if cur.get("session_id"):
             old_id = cur["session_id"]
             # Archive current session (dedup first)
-            chat_data["history"] = [h for h in chat_data.get("history", []) if h["session_id"] != old_id]
-            chat_data["history"].append({
-                "session_id": old_id,
-                "started_at": cur.get("started_at", ""),
-                "preview": cur.get("preview", ""),
-            })
+            chat_data["history"] = [
+                h for h in chat_data.get("history", []) if h["session_id"] != old_id
+            ]
+            chat_data["history"].append(
+                {
+                    "session_id": old_id,
+                    "started_at": cur.get("started_at", ""),
+                    "preview": cur.get("preview", ""),
+                }
+            )
             chat_data["history"] = chat_data["history"][-20:]
 
             # Get summary: prefer cached, otherwise generate
@@ -469,7 +533,9 @@ class SessionStore:
                 try:
                     old_title = generate_summary(old_id)
                     if old_title:
-                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
+                        self._data[user_id].setdefault("summaries", {})[old_id] = (
+                            old_title
+                        )
                         _write_custom_title(old_id, old_title)
                 except Exception:
                     old_title = ""
@@ -493,7 +559,9 @@ class SessionStore:
         chat_data["current"]["model"] = model
         await self._save_async()
 
-    async def set_cwd(self, user_id: str, chat_id: str, cwd: str, workspace_name: Optional[str] = None):
+    async def set_cwd(
+        self, user_id: str, chat_id: str, cwd: str, workspace_name: Optional[str] = None
+    ):
         """Set working directory for a specific chat"""
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         chat_data["current"]["cwd"] = cwd
@@ -506,7 +574,9 @@ class SessionStore:
         chat_data["current"]["permission_mode"] = mode
         await self._save_async()
 
-    async def resume_session(self, user_id: str, chat_id: str, index_or_id: str) -> tuple[Optional[str], str]:
+    async def resume_session(
+        self, user_id: str, chat_id: str, index_or_id: str
+    ) -> tuple[Optional[str], str]:
         """按序号（1-based）或 session_id 恢复 session，返回 (session_id, old_title)"""
         if user_id not in self._data:
             return None, ""
@@ -532,12 +602,16 @@ class SessionStore:
         old_id = cur.get("session_id")
         old_title = ""
         if old_id and old_id != session_id:
-            chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
-            chat_data["history"].append({
-                "session_id": old_id,
-                "started_at": cur.get("started_at", ""),
-                "preview": cur.get("preview", ""),
-            })
+            chat_data["history"] = [
+                h for h in chat_data["history"] if h["session_id"] != old_id
+            ]
+            chat_data["history"].append(
+                {
+                    "session_id": old_id,
+                    "started_at": cur.get("started_at", ""),
+                    "preview": cur.get("preview", ""),
+                }
+            )
             chat_data["history"] = chat_data["history"][-20:]
             # 获取摘要：优先缓存，否则生成
             summaries = self._data[user_id].get("summaries", {})
@@ -546,7 +620,9 @@ class SessionStore:
                 try:
                     old_title = generate_summary(old_id)
                     if old_title:
-                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
+                        self._data[user_id].setdefault("summaries", {})[old_id] = (
+                            old_title
+                        )
                         _write_custom_title(old_id, old_title)
                 except Exception:
                     old_title = ""
@@ -574,7 +650,11 @@ class SessionStore:
         if chat_key not in self._data[user_id]:
             return []
 
-        return list(reversed((await self._ensure_chat_data(user_id, chat_id)).get("history", [])))
+        return list(
+            reversed(
+                (await self._ensure_chat_data(user_id, chat_id)).get("history", [])
+            )
+        )
 
     def list_workspaces(self, user_id: str) -> dict[str, str]:
         """List saved workspaces for a user"""
@@ -602,7 +682,9 @@ class SessionStore:
         await self._save_async()
         return True
 
-    async def bind_workspace(self, user_id: str, chat_id: str, name: str) -> Optional[str]:
+    async def bind_workspace(
+        self, user_id: str, chat_id: str, name: str
+    ) -> Optional[str]:
         """Bind a saved workspace to the current chat"""
         path = self._user(user_id).get("workspaces", {}).get(name)
         if not path:

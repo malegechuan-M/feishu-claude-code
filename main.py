@@ -64,6 +64,29 @@ _SEEN_MSG_MAX = 200
 _seen_content: dict[str, float] = {}
 _CONTENT_DEDUP_TTL = 120  # 秒
 
+# 最后处理消息的时间戳（用于重启后补偿漏掉的消息）
+_LAST_MSG_TS_FILE = os.path.expanduser("~/.feishu-claude/last_msg_ts.json")
+
+def _load_last_msg_ts() -> dict[str, float]:
+    """加载每个群的最后处理消息时间戳"""
+    try:
+        if os.path.exists(_LAST_MSG_TS_FILE):
+            return json.loads(open(_LAST_MSG_TS_FILE, encoding="utf-8").read())
+    except Exception:
+        pass
+    return {}
+
+def _save_last_msg_ts(chat_id: str, ts: float):
+    """更新并持久化某个群的最后处理消息时间戳"""
+    data = _load_last_msg_ts()
+    data[chat_id] = ts
+    try:
+        os.makedirs(os.path.dirname(_LAST_MSG_TS_FILE), exist_ok=True)
+        with open(_LAST_MSG_TS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
 # Layer 3: 去重持久化文件（防止重启后重放）
 _SEEN_IDS_FILE = os.path.expanduser("~/.feishu-claude/seen_messages.json")
 
@@ -480,6 +503,9 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
     async with lock:
         try:
             await _process_message(user_id, chat_id, is_group, msg)
+            # 记录最后处理时间戳（用于重启补偿）
+            if is_group:
+                _save_last_msg_ts(chat_id, time.time())
         except Exception as e:
             print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
@@ -875,22 +901,27 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
         print(f"[instinct] 获取失败: {_ie}", flush=True)
 
     env_hint = ""
+    group_rule = ""
+    if is_group:
+        group_rule = (
+            "\n\n[群聊@人规则·每次必读] "
+            "当你需要安排任务给麦克斯（OpenClaw Bot）时，必须在回复文本中直接写「@麦克斯」。"
+            "不要用飞书 MCP 发消息，不要用 @_user_1 占位符，直接在回复文本里写「@麦克斯」即可。"
+            "系统会自动把文本中的「@麦克斯」转换为真正的飞书@mention 并调用 OpenClaw CLI 执行任务。"
+            "可用的@对象：@麦克斯（OpenClaw Bot，负责执行采集/分析/调研等任务）。"
+            "示例：'@麦克斯 请去做小红书关键词采集，关键词是空间香氛'。"
+            "重要：不要用 im_v1_message_create 给麦克斯发消息，麦克斯收不到，必须用「@麦克斯」写在回复正文里。"
+        )
     if not session.session_id:
-        group_rule = ""
-        if is_group:
-            group_rule = (
-                "\n\n[群聊@人规则] "
-                "当你需要安排任务给其他人或Bot时，必须在回复文本中直接写「@麦克斯」（不是 @_user_1 这种占位符）。"
-                "系统会自动把文本中的「@麦克斯」转换为真正的飞书@mention。"
-                "可用的@对象：@麦克斯（OpenClaw Bot，负责执行采集/分析/调研等任务）。"
-                "示例：'@麦克斯 请去做小红书关键词采集，关键词是空间香氛'。"
-            )
         env_hint = (
             "[环境：用户通过飞书发送消息，无交互式UI。"
             "当需要用户做选择时，用编号列表呈现选项（1. 2. 3.），"
             "最后加一个「其他（请说明）」选项，用户回复数字即可。"
             f"简单确认用 Y/N。{group_rule}]"
         )
+    elif group_rule:
+        # 即使 session 已存在，群聊@人规则也必须注入
+        env_hint = group_rule
 
     claude_msg = build_context(
         text,
@@ -1044,19 +1075,28 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
         OPENCLAW_MAX_ROUNDS = 5
 
-        # 检测是否需要调用 OpenClaw agent
+        # 检测是否需要调用 OpenClaw agent（同时检查 Claude 回复和用户原始消息）
         _matched_trigger = None
         _matched_agent = None
-        for trigger, agent_id in config.OPENCLAW_AGENTS.items():
-            if trigger in full_text:
-                _matched_trigger = trigger
-                _matched_agent = agent_id
+        _search_texts = [full_text, text]  # Claude 回复 + 用户消息都检测
+        for _st in _search_texts:
+            if _matched_trigger:
                 break
-        # 兜底：检测 @_user_N 占位符
-        if not _matched_trigger and re.search(r'@_user_\d+', full_text):
-            _matched_trigger = re.search(r'@_user_\d+', full_text).group(0)
-            _matched_agent = "agent-a-coo"
-            print(f"[openclaw] 检测到占位符 {_matched_trigger}，映射到 {_matched_agent}", flush=True)
+            for trigger, agent_id in config.OPENCLAW_AGENTS.items():
+                if trigger in _st:
+                    _matched_trigger = trigger
+                    _matched_agent = agent_id
+                    print(f"[openclaw] 触发词「{trigger}」命中，来源: {'Claude回复' if _st is full_text else '用户消息'}", flush=True)
+                    break
+        # 兜底：检测 @_user_N 占位符（用户消息和 Claude 回复都检查）
+        if not _matched_trigger:
+            for _st in _search_texts:
+                _m = re.search(r'@_user_\d+', _st)
+                if _m:
+                    _matched_trigger = _m.group(0)
+                    _matched_agent = "agent-a-coo"
+                    print(f"[openclaw] 检测到占位符 {_matched_trigger}，映射到 {_matched_agent}", flush=True)
+                    break
 
         if _matched_trigger and _matched_agent:
             # 提取任务内容（去掉触发词和占位符）
@@ -1070,43 +1110,80 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
                 # ── 公共工具函数 ──
 
+                OC_MAX_WAIT = 1800       # 最长等 30 分钟
+                OC_POLL_INTERVAL = 10    # 每 10 秒检查一次
+                OC_PROGRESS_INTERVAL = 120  # 每 2 分钟发一次进度提示
+
                 async def _call_oc(agent_id, message, deliver=True):
-                    """调用 OpenClaw agent，返回 (result_text, result_obj, oc_model) 或 None"""
+                    """非阻塞调用 OpenClaw agent，轮询等待完成，返回 (result_text, result_obj, oc_model) 或 None"""
                     cmd = [
                         config.OPENCLAW_CLI, "agent",
                         "--agent", agent_id,
                         "--message", message,
                         "--json",
-                        "--timeout", "300",
+                        "--timeout", str(OC_MAX_WAIT),
                     ]
                     if deliver and reply_target:
                         cmd += ["--deliver", "--reply-channel", "feishu", "--reply-to", reply_target]
+
                     try:
-                        _cmd = list(cmd)
-                        proc = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda c=_cmd: _sp.run(c, capture_output=True, text=True, timeout=360)
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
                         )
-                    except _sp.TimeoutExpired:
-                        print(f"[openclaw] 超时", flush=True)
-                        return None
                     except Exception as e:
-                        print(f"[openclaw] 异常: {e}", flush=True)
+                        print(f"[openclaw] 启动进程失败: {e}", flush=True)
                         return None
+
+                    # 非阻塞轮询：每 10 秒检查进程是否完成
+                    elapsed = 0
+                    last_progress = 0
+                    while elapsed < OC_MAX_WAIT:
+                        await asyncio.sleep(OC_POLL_INTERVAL)
+                        elapsed += OC_POLL_INTERVAL
+
+                        if proc.returncode is not None:
+                            break  # 进程已结束
+
+                        # 定期发进度提示到群里
+                        if elapsed - last_progress >= OC_PROGRESS_INTERVAL:
+                            last_progress = elapsed
+                            minutes = elapsed // 60
+                            print(f"[openclaw] 已等待 {minutes} 分钟，仍在执行...", flush=True)
+
+                    # 检查是否超时
+                    if proc.returncode is None:
+                        print(f"[openclaw] 超过 {OC_MAX_WAIT // 60} 分钟，强制终止", flush=True)
+                        proc.kill()
+                        await proc.wait()
+                        return None
+
+                    stdout_bytes = await proc.stdout.read()
+                    stderr_bytes = await proc.stderr.read()
+                    stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+                    stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+
                     if proc.returncode != 0:
-                        print(f"[openclaw] 失败: {proc.stderr[:200]}", flush=True)
+                        print(f"[openclaw] 失败 (rc={proc.returncode}): {stderr_str[:300]}", flush=True)
+                        print(f"[openclaw] stdout: {stdout_str[:300] if stdout_str else '(空)'}", flush=True)
                         return None
+
                     result_text = ""
                     result_obj = {}
                     oc_model = ""
                     try:
-                        result_obj = _json.loads(proc.stdout)
+                        result_obj = _json.loads(stdout_str)
                         payloads = result_obj.get("result", {}).get("payloads", [])
                         result_text = "\n".join(p.get("text", "") for p in payloads if p.get("text"))
                         _meta = result_obj.get("result", {}).get("meta", {}).get("agentMeta", {})
                         oc_model = _meta.get("model", "")
-                    except Exception:
-                        result_text = proc.stdout[:2000] if proc.stdout else ""
+                        if not result_text.strip():
+                            print(f"[openclaw] 解析成功但文本为空, payloads={payloads[:3]}", flush=True)
+                            print(f"[openclaw] result keys: {list(result_obj.get('result', {}).keys())}", flush=True)
+                    except Exception as e:
+                        print(f"[openclaw] JSON解析失败: {e}, stdout前300字: {stdout_str[:300] if stdout_str else '(空)'}", flush=True)
+                        result_text = stdout_str[:2000] if stdout_str else ""
                     return (result_text, result_obj, oc_model)
 
                 # 复杂度标记，由 _classify_mode 设置
@@ -1169,15 +1246,22 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
 
                 async def _task_loop():
                     task_desc = (
-                        f"{relay_text}\n\n"
-                        f"---\n"
-                        f"[协同提示] 这是 Claude Bot 派发的任务。请先判断任务类型：\n"
-                        f"- 如果涉及市场调研、数据采集、竞品分析 → 考虑调用 agent-b-research\n"
-                        f"- 如果涉及流程优化、自动化 → 考虑调用 agent-e-workflow\n"
-                        f"- 如果涉及合规、法务 → 考虑调用 agent-f-legal\n"
-                        f"- 如果是简单问答或你能直接完成的 → 直接回复即可\n"
-                        f"请根据任务复杂度自行决定是否需要子 agent 协助。\n\n"
-                        f"[格式要求] 回复开头必须加标注：「[麦克斯 → Claude] 等待 Claude 验收」"
+                        f"# 任务指令\n\n"
+                        f"## 任务内容\n{relay_text}\n\n"
+                        f"## 执行要求\n"
+                        f"1. **直接执行，不要解释**：不要分析任务难度、不要列出「可能的方向」，直接动手做\n"
+                        f"2. **必须有交付物**：你的回复必须包含具体产出（数据表格/分析结论/文件内容/执行结果），纯文字解释视为未完成\n"
+                        f"3. **遇到障碍不要停**：如果一种方法不行，换另一种，至少尝试2种方案后再报告卡点\n"
+                        f"4. **善用工具**：能调用工具获取数据的，直接调用，不要用「建议去查一下」代替\n\n"
+                        f"## 子 agent 路由（按需调用）\n"
+                        f"- 市场调研/数据采集/竞品分析 → agent-b-research\n"
+                        f"- 流程优化/自动化 → agent-e-workflow\n"
+                        f"- 合规/法务 → agent-f-legal\n"
+                        f"- 简单问答或你能直接完成 → 直接回复\n\n"
+                        f"## 输出格式\n"
+                        f"回复开头：「[麦克斯 → Claude] 等待 Claude 验收」\n"
+                        f"回复结构：先给结论/交付物，再给过程说明（如有必要）\n"
+                        f"禁止：不要用「建议你可以…」「这需要考虑…」「一般来说…」等空话开头"
                     )
                     agent_id = _matched_agent
 
@@ -1185,10 +1269,23 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         round_label = f"第{round_n}轮" if round_n > 1 else "首轮"
                         print(f"[openclaw][工作] {round_label}: {task_desc[:80]}...", flush=True)
 
+                        # 发进度提示，让群里看到麦克斯在干活
+                        progress_msg = f"[Claude → 麦克斯] 📤 任务已派发（{round_label}），麦克斯执行中..." if round_n == 1 else f"[Claude → 麦克斯] 🔄 返工指令已下达（{round_label}），麦克斯执行中..."
+                        await feishu.send_card_to_group(chat_id, progress_msg)
+
                         oc_result = await _call_oc(agent_id, task_desc)
                         if not oc_result or not oc_result[0].strip():
-                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 麦克斯返回空结果（{round_label}），停止协同")
-                            return
+                            # 空结果，催促重试一次
+                            print(f"[openclaw][工作] {round_label} 空结果，催促重试...", flush=True)
+                            retry_prompt = (
+                                f"你上一次没有返回任何内容。请务必完成任务并返回结果。\n\n"
+                                f"【任务内容】\n{task_desc}\n\n"
+                                f"重要：你必须给出实质性的回复内容，不能返回空结果。"
+                            )
+                            oc_result = await _call_oc(agent_id, retry_prompt)
+                            if not oc_result or not oc_result[0].strip():
+                                await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 麦克斯两次返回空结果（{round_label}），停止协同")
+                                return
                         result_text, result_obj, oc_model = oc_result
 
                         # Claude 验收
@@ -1227,12 +1324,17 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                             return
 
                         task_desc = (
-                            f"这是返工指令（第{round_n+1}轮）。\n\n"
-                            f"【原始任务】\n{relay_text}\n\n"
-                            f"【你上一轮的结果被驳回，验收意见如下】\n{review[:2000]}\n\n"
-                            f"请根据验收意见修改并重新提交结果。\n"
-                            f"提示：如果上一轮你独自完成但质量不够，考虑调用子 agent（如 agent-b-research）协助。\n\n"
-                            f"[格式要求] 回复开头必须加标注：「[麦克斯 → Claude] 等待 Claude 验收」"
+                            f"# 返工指令（第{round_n+1}轮）\n\n"
+                            f"## 原始任务\n{relay_text}\n\n"
+                            f"## 驳回原因\n{review[:2000]}\n\n"
+                            f"## 返工要求\n"
+                            f"1. 针对上面的驳回原因，逐条修正\n"
+                            f"2. 如果上轮独自完成但质量不够 → 必须调用子 agent（如 agent-b-research）协助\n"
+                            f"3. 不要重复上轮的做法，必须换方案或补充缺失内容\n"
+                            f"4. 回复必须包含完整的修改后交付物，不要只说「已修改」\n\n"
+                            f"## 输出格式\n"
+                            f"回复开头：「[麦克斯 → Claude] 等待 Claude 验收」\n"
+                            f"先给修改后的完整交付物，再简要说明改了什么"
                         )
 
                 # ── 讨论模式：Claude 观点 → 麦克斯回应 → Claude 回应 → ... → Claude 总结 ──
@@ -1265,10 +1367,24 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                         )
                         print(f"[openclaw][讨论] {round_label} 麦克斯回应中...", flush=True)
 
+                        # 发进度提示
+                        await feishu.send_card_to_group(chat_id, f"[Claude → 麦克斯] 💬 等待麦克斯回应（{round_label}）...")
+
                         oc_result = await _call_oc(agent_id, discuss_prompt)
                         if not oc_result or not oc_result[0].strip():
-                            await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 麦克斯无回应（{round_label}），结束讨论")
-                            break
+                            # 空结果，催促重试一次
+                            print(f"[openclaw][讨论] {round_label} 空结果，催促重试...", flush=True)
+                            retry_prompt = (
+                                f"你上一次没有返回任何内容。请务必回应讨论。\n\n"
+                                f"【讨论主题】\n{relay_text}\n\n"
+                                f"【Claude 的观点】\n{claude_position[:2000]}\n\n"
+                                f"重要：你必须给出实质性的回复内容，表达你的观点。\n\n"
+                                f"[格式要求] 回复开头必须加标注：「[麦克斯 → Claude] 等待 Claude 回应」"
+                            )
+                            oc_result = await _call_oc(agent_id, retry_prompt)
+                            if not oc_result or not oc_result[0].strip():
+                                await feishu.send_card_to_group(chat_id, f"[Claude → 老大]\n⚠️ 麦克斯两次无回应（{round_label}），结束讨论")
+                                break
                         oc_response, _, oc_model = oc_result
                         discussion_log.append(("麦克斯", oc_response))
 
@@ -1553,6 +1669,60 @@ def main():
 
     indexing_thread = threading.Thread(target=_start_indexer, daemon=True)
     indexing_thread.start()
+
+    # 启动时补偿漏掉的消息（重启期间 @bot 的消息）
+    def _start_catchup():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_catchup_missed_messages())
+
+    async def _catchup_missed_messages():
+        """检查重启期间是否有漏掉的 @bot 消息，有则重新处理"""
+        last_ts_map = _load_last_msg_ts()
+        if not last_ts_map or not BOT_OPEN_ID:
+            return
+
+        for chat_id, last_ts in last_ts_map.items():
+            elapsed = time.time() - last_ts
+            if elapsed > 600:  # 超过 10 分钟不补偿，避免处理太旧的消息
+                continue
+            try:
+                missed = await feishu.fetch_missed_mentions(
+                    chat_id, last_ts, BOT_OPEN_ID, limit=5
+                )
+                if missed:
+                    print(
+                        f"[catchup] 群 {chat_id[:8]} 发现 {len(missed)} 条漏掉的 @消息，开始补偿处理",
+                        flush=True,
+                    )
+                    for msg_info in missed:
+                        mid = msg_info["message_id"]
+                        if mid and mid in _seen_msg_ids:
+                            continue  # 已处理过
+                        # 构造精简的 mock 事件，直接调用 _process_message
+                        class _MockMsg:
+                            pass
+                        mock = _MockMsg()
+                        mock.message_id = mid
+                        mock.message_type = msg_info.get("msg_type", "text")
+                        mock.content = json.dumps({"text": msg_info["content"]}) if mock.message_type == "text" else msg_info["content"]
+                        mock.mentions = msg_info.get("mentions", [])
+
+                        sender_id = msg_info.get("sender_id", "")
+                        print(f"[catchup] 补偿处理: {msg_info['content'][:50]}...", flush=True)
+                        try:
+                            await _process_message(sender_id, chat_id, True, mock)
+                            _save_last_msg_ts(chat_id, time.time())
+                            _seen_msg_ids[mid] = time.time()
+                        except Exception as e:
+                            print(f"[catchup] 补偿处理失败: {e}", flush=True)
+                else:
+                    print(f"[catchup] 群 {chat_id[:8]} 无漏掉消息", flush=True)
+            except Exception as e:
+                print(f"[catchup] 群 {chat_id[:8]} 检查失败: {e}", flush=True)
+
+    catchup_thread = threading.Thread(target=_start_catchup, daemon=True)
+    catchup_thread.start()
 
     print("✅ 连接飞书 WebSocket 长连接（自动重连）...")
     ws_client.start()  # 阻塞，内部运行 asyncio loop
